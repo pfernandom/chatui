@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 
@@ -46,6 +47,38 @@ type MessageRenderer func(input string) string
 type ErrorRenderer func(err error) string
 type OverlayView func(*App) *tui.Element
 
+// SlashCommand describes input that begins with "/" after trimming.
+type SlashCommand struct {
+	Raw  string
+	Name string
+	Args string
+}
+
+// SlashCommandHandler runs on submit when input is a slash command. If handled is true,
+// HandleResponse is not invoked. If handled is false, the full line is sent as a normal
+// request (same as non-slash input).
+type SlashCommandHandler func(*App, SlashCommand) (handled bool, err error)
+
+// ParseSlashCommand reports whether trimmed begins with "/". Name is the first segment;
+// Args is the remainder after the first run of spaces. For "/" alone, Name and Args are empty.
+func ParseSlashCommand(trimmed string) (SlashCommand, bool) {
+	if !strings.HasPrefix(trimmed, "/") {
+		return SlashCommand{}, false
+	}
+	raw := trimmed
+	body := strings.TrimSpace(trimmed[1:])
+	if body == "" {
+		return SlashCommand{Raw: raw}, true
+	}
+	i := strings.IndexByte(body, ' ')
+	if i < 0 {
+		return SlashCommand{Raw: raw, Name: body}, true
+	}
+	name := strings.TrimSpace(body[:i])
+	args := strings.TrimSpace(body[i+1:])
+	return SlashCommand{Raw: raw, Name: name, Args: args}, true
+}
+
 type Config struct {
 	Title            string
 	Placeholder      string
@@ -62,6 +95,13 @@ type Config struct {
 
 	SettingsView OverlayView
 	HelpView     OverlayView
+
+	// SlashCommandHandler is optional. When set, ParseSlashCommand(trimmed) is used on submit.
+	SlashCommandHandler SlashCommandHandler
+	// SlashCommandNames lists available slash names without a leading "/". When non-empty,
+	// "/" triggers autocomplete hints and Tab completes the active (last) line when it looks
+	// like a single slash token (see package docs).
+	SlashCommandNames []string
 }
 
 type App struct {
@@ -82,6 +122,9 @@ type App struct {
 
 	instructions string
 	queueUpdate  func(func())
+
+	slashTabCycle      int
+	slashLastTabPrefix string
 }
 
 func New(config Config) *App {
@@ -135,6 +178,37 @@ func (a *App) BindApp(app *tui.App) {
 	a.textarea.BindApp(app)
 }
 
+// PrintAboveln appends a formatted line to the history region above the inline composer.
+// It forwards to the bound go-tui App; no-op if BindApp has not run yet.
+func (a *App) PrintAboveln(format string, args ...any) {
+	if a == nil || a.app == nil {
+		return
+	}
+	a.app.PrintAboveln(format, args...)
+}
+
+// QueuePrintAboveln is the goroutine-safe counterpart of [App.PrintAboveln].
+func (a *App) QueuePrintAboveln(format string, args ...any) {
+	if a == nil || a.app == nil {
+		return
+	}
+	a.app.QueuePrintAboveln(format, args...)
+}
+
+// Terminal returns the underlying go-tui Terminal (e.g. for Clear). Returns nil before the shell is bound.
+func (a *App) Terminal() tui.Terminal {
+	if a == nil || a.app == nil {
+		return nil
+	}
+	return a.app.Terminal()
+}
+
+// IsFocused reports whether the composer is focused. It allows focus-gated key bindings
+// merged into App.KeyMap to align with the embedded TextArea.
+func (a *App) IsFocused() bool {
+	return a != nil && a.textarea != nil && a.textarea.IsFocused()
+}
+
 func (a *App) KeyMap() tui.KeyMap {
 	if a.showSettings.Get() || a.showHelp.Get() {
 		return tui.KeyMap{
@@ -143,9 +217,20 @@ func (a *App) KeyMap() tui.KeyMap {
 		}
 	}
 
-	km := a.textarea.KeyMap()
+	var km tui.KeyMap
+	if len(a.config.SlashCommandNames) > 0 {
+		km = append(km, tui.OnFocused(tui.Rune('/'), func(ke tui.KeyEvent) {
+			_ = a.textarea.HandleEvent(tui.KeyEvent{Key: tui.KeyRune, Rune: '/'})
+		}))
+	}
+	km = append(km, a.textarea.KeyMap()...)
 	km = append(km,
-		tui.OnStop(tui.KeyTab, func(ke tui.KeyEvent) { a.toggleMultiline() }),
+		tui.OnStop(tui.KeyTab, func(ke tui.KeyEvent) {
+			if len(a.config.SlashCommandNames) > 0 && a.trySlashTabComplete() {
+				return
+			}
+			a.toggleMultiline()
+		}),
 		tui.OnStop(tui.KeyEscape, func(ke tui.KeyEvent) { ke.App().Stop() }),
 		tui.OnStop(tui.KeyCtrlC, func(ke tui.KeyEvent) { ke.App().Stop() }),
 	)
@@ -193,6 +278,12 @@ func (a *App) Render(app *tui.App) *tui.Element {
 		tui.WithText(a.metaText()),
 		tui.WithTextStyle(tui.NewStyle().Foreground(tui.Green)),
 	))
+	if line := a.slashCommandsHintLine(); line != "" {
+		root.AddChild(tui.New(
+			tui.WithText(line),
+			tui.WithTextStyle(tui.NewStyle().Dim()),
+		))
+	}
 	root.AddChild(a.textarea.Render(app))
 	root.AddChild(tui.New(
 		tui.WithText(a.statusText()),
@@ -208,9 +299,39 @@ func (a *App) send(text string) {
 		return
 	}
 
+	stop, slashErr := a.dispatchSlashCommand(trimmed)
+	if stop {
+		a.textarea.Clear()
+		if slashErr != nil {
+			a.app.PrintAboveln("%s", a.config.RenderError(slashErr))
+		}
+		return
+	}
+
 	a.textarea.Clear()
 	a.app.PrintAboveln("%s", a.config.RenderUserMessage(trimmed))
 	a.startResponse(trimmed)
+}
+
+// dispatchSlashCommand handles slash-only submit routing. If stop is true, the caller
+// should clear the textarea and must not start a normal response; err is set when the
+// handler failed (caller prints RenderError). If stop is false, fall through to streaming.
+func (a *App) dispatchSlashCommand(trimmed string) (stop bool, err error) {
+	if a.config.SlashCommandHandler == nil {
+		return false, nil
+	}
+	sc, ok := ParseSlashCommand(trimmed)
+	if !ok {
+		return false, nil
+	}
+	handled, err := a.config.SlashCommandHandler(a, sc)
+	if err != nil {
+		return true, err
+	}
+	if handled {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (a *App) startResponse(input string) {
@@ -306,6 +427,117 @@ func (a *App) toggleMultiline() {
 	a.multiline.Set(!a.multiline.Get())
 }
 
+func (a *App) trySlashTabComplete() bool {
+	names := a.config.SlashCommandNames
+	if len(names) == 0 {
+		return false
+	}
+	full := a.textarea.Text()
+	line := activeLineLast(full)
+	if !strings.HasPrefix(line, "/") {
+		return false
+	}
+	inner := line[1:]
+	if strings.ContainsAny(inner, " \t") {
+		return false
+	}
+	pref := inner
+	matches := filterSlashPrefixMatches(names, pref)
+	if len(matches) == 0 {
+		return false
+	}
+	if pref != a.slashLastTabPrefix {
+		a.slashTabCycle = 0
+	}
+	lcp := longestCommonPrefixStrings(matches)
+	newLast, cycle := slashTabStep(pref, matches, lcp, a.slashTabCycle)
+	if newLast == "" {
+		return false
+	}
+	a.slashTabCycle = cycle
+	a.slashLastTabPrefix = strings.TrimPrefix(newLast, "/")
+	a.textarea.SetText(replaceActiveLine(full, newLast))
+	return true
+}
+
+func activeLineLast(full string) string {
+	if full == "" {
+		return ""
+	}
+	i := strings.LastIndex(full, "\n")
+	if i < 0 {
+		return full
+	}
+	return full[i+1:]
+}
+
+func replaceActiveLine(full, newLast string) string {
+	if !strings.Contains(full, "\n") {
+		return newLast
+	}
+	i := strings.LastIndex(full, "\n")
+	return full[:i+1] + newLast
+}
+
+func filterSlashPrefixMatches(names []string, pref string) []string {
+	pl := strings.ToLower(pref)
+	var out []string
+	for _, n := range names {
+		if strings.HasPrefix(strings.ToLower(n), pl) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func longestCommonPrefixStrings(strs []string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	base := strs[0]
+	for i := 0; i < len(base); i++ {
+		c := base[i]
+		for _, s := range strs[1:] {
+			if i >= len(s) || s[i] != c {
+				return base[:i]
+			}
+		}
+	}
+	return base
+}
+
+// slashTabStep returns the new last-line content (including leading "/") and updated cycle index.
+func slashTabStep(pref string, matches []string, lcp string, cycle int) (newLast string, newCycle int) {
+	if len(matches) == 1 {
+		m := matches[0]
+		if strings.EqualFold(m, pref) {
+			return "/" + m + " ", 0
+		}
+		if strings.HasPrefix(strings.ToLower(m), strings.ToLower(pref)) {
+			return "/" + m, 0
+		}
+		return "", 0
+	}
+	if !strings.EqualFold(pref, lcp) && strings.HasPrefix(strings.ToLower(lcp), strings.ToLower(pref)) {
+		return "/" + lcp, 0
+	}
+	next := cycle % len(matches)
+	pick := matches[next]
+	return "/" + pick, cycle + 1
+}
+
+func (a *App) slashCommandsHintLine() string {
+	if len(a.config.SlashCommandNames) == 0 {
+		return ""
+	}
+	line := activeLineLast(a.textarea.Text())
+	if !strings.HasPrefix(line, "/") {
+		return ""
+	}
+	return "Slash: " + strings.Join(a.config.SlashCommandNames, ", ")
+}
+
 func (a *App) openSettings() {
 	if a.app == nil || a.config.SettingsView == nil || a.showSettings.Get() {
 		return
@@ -344,7 +576,12 @@ func (a *App) instructionsText() string {
 	if a.instructions != "" {
 		return a.instructions
 	}
-	parts := []string{"Enter sends above the widget.", "Tab toggles compact/multiline."}
+	parts := []string{"Enter sends above the widget."}
+	if len(a.config.SlashCommandNames) > 0 {
+		parts = append(parts, "Tab completes slash commands on a / line, or toggles compact/multiline otherwise.")
+	} else {
+		parts = append(parts, "Tab toggles compact/multiline.")
+	}
 	if a.config.SettingsView != nil {
 		parts = append(parts, "Ctrl+S opens settings.")
 	}
@@ -434,7 +671,29 @@ func normalizeConfig(config Config) Config {
 			return fmt.Sprintf("Error: %v", err)
 		}
 	}
+	cfg.SlashCommandNames = normalizeSlashNames(cfg.SlashCommandNames)
 	return cfg
+}
+
+func normalizeSlashNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type requestStream struct {

@@ -14,9 +14,11 @@ var botGradient = tui.NewGradient(tui.BrightCyan, tui.BrightMagenta)
 
 func main() {
 	shell := chat.New(chat.Config{
-		Instructions:     "Enter a message to send to the bot.",
-		DefaultMultiline: true,
-		HandleResponse:   handleResponse,
+		Instructions:        "Enter a message to send to the bot.",
+		DefaultMultiline:    true,
+		HandleResponse:      handleResponse,
+		SlashCommandHandler: slashCommandHandler,
+		SlashCommandNames:   []string{"help", "clear"},
 	})
 
 	app, err := shell.Start()
@@ -48,4 +50,18 @@ func handleResponse(req *chat.Request) error {
 	req.SetStatus("Reply streamed")
 
 	return nil
+}
+
+func slashCommandHandler(app *chat.App, sc chat.SlashCommand) (bool, error) {
+	switch sc.Name {
+	case "help":
+		app.PrintAboveln("Help: %s", sc.Args)
+		return true, nil
+	case "clear":
+		if term := app.Terminal(); term != nil {
+			term.Clear()
+		}
+		return true, nil
+	}
+	return false, nil
 }
