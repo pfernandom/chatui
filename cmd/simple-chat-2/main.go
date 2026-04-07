@@ -41,8 +41,13 @@ func handleResponse(req *chat.Request) error {
 	)
 	req.SetStatus("Streaming reply above the input field...")
 
+	gradient := botGradient
+	if req.FromSlash {
+		gradient = tui.NewGradient(tui.BrightRed, tui.BrightYellow)
+	}
+
 	for _, r := range reply {
-		if _, err := req.Stream.WriteGradient(string(r), botGradient); err != nil {
+		if _, err := req.Stream.WriteGradient(string(r), gradient); err != nil {
 			return err
 		}
 		time.Sleep(14 * time.Millisecond)
@@ -52,16 +57,18 @@ func handleResponse(req *chat.Request) error {
 	return nil
 }
 
-func slashCommandHandler(app *chat.App, sc chat.SlashCommand) (bool, error) {
+func slashCommandHandler(app *chat.App, sc chat.SlashCommand) (chat.SlashResponse, error) {
 	switch sc.Name {
 	case "help":
-		app.PrintAboveln("Help: %s", sc.Args)
-		return true, nil
+		if len(sc.Args) == 0 {
+			return sc.NewResponse("Help: available commands are: help, clear"), nil
+		}
+		return sc.NewResponse(fmt.Sprintf("Help: %s", sc.Args)), nil
 	case "clear":
 		if term := app.Terminal(); term != nil {
 			term.Clear()
 		}
-		return true, nil
+		return sc.Handled(), nil
 	}
-	return false, nil
+	return sc.Forward(), nil
 }

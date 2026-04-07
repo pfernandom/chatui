@@ -32,6 +32,12 @@ type Request struct {
 	TerminalApp *tui.App
 	Shell       *App
 
+	// FromSlash is true when this request was produced from the slash-command path
+	// (fallthrough or streaming from a non-fallthrough SlashResponse). When false, Slash is zero.
+	FromSlash bool
+	// Slash holds the parsed command when FromSlash is true.
+	Slash SlashCommand
+
 	id uint64
 }
 
@@ -54,10 +60,53 @@ type SlashCommand struct {
 	Args string
 }
 
-// SlashCommandHandler runs on submit when input is a slash command. If handled is true,
-// HandleResponse is not invoked. If handled is false, the full line is sent as a normal
-// request (same as non-slash input).
-type SlashCommandHandler func(*App, SlashCommand) (handled bool, err error)
+// SlashResponse is returned by SlashCommandHandler to control echo and streaming.
+type SlashResponse struct {
+	Command  SlashCommand
+	Response string
+	Handled  bool
+}
+
+// NewResponse returns a SlashResponse with Handled false and Response set to content.
+// RenderUserMessage and Request.Input both use Response for the streaming path.
+func (sc SlashCommand) NewResponse(content string) SlashResponse {
+	return SlashResponse{
+		Command:  sc,
+		Response: content,
+		Handled:  false,
+	}
+}
+
+// Forward returns a SlashResponse that passes through the raw slash line as Response,
+// with Handled false (same echo and Input as a fallthrough).
+func (sc SlashCommand) Forward() SlashResponse {
+	return SlashResponse{
+		Command:  sc,
+		Response: sc.Raw,
+		Handled:  false,
+	}
+}
+
+// Handled returns a SlashResponse with Handled true and Command set to sc.
+// The shell clears the input and does not echo or call HandleResponse.
+func (sc SlashCommand) Handled() SlashResponse {
+	return SlashResponse{
+		Command: sc,
+		Handled: true,
+	}
+}
+
+// IsFallthrough reports whether the handler returned the zero value, meaning: fall through
+// to normal submit (echo trimmed line, stream with Input == trimmed).
+func (r SlashResponse) IsFallthrough() bool {
+	return r == SlashResponse{}
+}
+
+// SlashCommandHandler runs when Config.SlashCommandHandler is set and the trimmed line parses as a slash command.
+// Return SlashResponse{} (zero value) to fall through: echo the full line and stream with Input == trimmed.
+// Return Handled() to handle locally (no echo, no HandleResponse).
+// Return NewResponse or Forward with Handled false to echo Response and stream with Input == Response.
+type SlashCommandHandler func(*App, SlashCommand) (SlashResponse, error)
 
 // ParseSlashCommand reports whether trimmed begins with "/". Name is the first segment;
 // Args is the remainder after the first run of spaces. For "/" alone, Name and Args are empty.
@@ -299,42 +348,50 @@ func (a *App) send(text string) {
 		return
 	}
 
-	stop, slashErr := a.dispatchSlashCommand(trimmed)
-	if stop {
+	resp, sc, slashPath, err := a.dispatchSlashCommand(trimmed)
+	if err != nil {
 		a.textarea.Clear()
-		if slashErr != nil {
-			a.app.PrintAboveln("%s", a.config.RenderError(slashErr))
+		a.app.PrintAboveln("%s", a.config.RenderError(err))
+		return
+	}
+	if slashPath {
+		if resp.IsFallthrough() {
+			a.textarea.Clear()
+			a.app.PrintAboveln("%s", a.config.RenderUserMessage(trimmed))
+			a.startResponse(trimmed, sc, true)
+			return
 		}
+		if resp.Handled {
+			a.textarea.Clear()
+			return
+		}
+		a.textarea.Clear()
+		a.app.PrintAboveln("%s", a.config.RenderUserMessage(resp.Response))
+		a.startResponse(resp.Response, resp.Command, true)
 		return
 	}
 
 	a.textarea.Clear()
 	a.app.PrintAboveln("%s", a.config.RenderUserMessage(trimmed))
-	a.startResponse(trimmed)
+	a.startResponse(trimmed, SlashCommand{}, false)
 }
 
-// dispatchSlashCommand handles slash-only submit routing. If stop is true, the caller
-// should clear the textarea and must not start a normal response; err is set when the
-// handler failed (caller prints RenderError). If stop is false, fall through to streaming.
-func (a *App) dispatchSlashCommand(trimmed string) (stop bool, err error) {
+// dispatchSlashCommand invokes the slash handler when configured and the line parses as a slash command.
+// slashPath is false when the handler is unset or the line is not a slash command (caller uses plain submit).
+func (a *App) dispatchSlashCommand(trimmed string) (resp SlashResponse, sc SlashCommand, slashPath bool, err error) {
 	if a.config.SlashCommandHandler == nil {
-		return false, nil
+		return SlashResponse{}, SlashCommand{}, false, nil
 	}
-	sc, ok := ParseSlashCommand(trimmed)
+	var ok bool
+	sc, ok = ParseSlashCommand(trimmed)
 	if !ok {
-		return false, nil
+		return SlashResponse{}, SlashCommand{}, false, nil
 	}
-	handled, err := a.config.SlashCommandHandler(a, sc)
-	if err != nil {
-		return true, err
-	}
-	if handled {
-		return true, nil
-	}
-	return false, nil
+	resp, err = a.config.SlashCommandHandler(a, sc)
+	return resp, sc, true, err
 }
 
-func (a *App) startResponse(input string) {
+func (a *App) startResponse(input string, slash SlashCommand, fromSlash bool) {
 	reqCtx, cancel := context.WithCancel(context.Background())
 	stream := newRequestStream(reqCtx, a.app.StreamAbove())
 
@@ -350,6 +407,8 @@ func (a *App) startResponse(input string) {
 		Stream:      stream,
 		TerminalApp: a.app,
 		Shell:       a,
+		FromSlash:   fromSlash,
+		Slash:       slash,
 		id:          reqID,
 	}
 

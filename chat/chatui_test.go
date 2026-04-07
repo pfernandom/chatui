@@ -186,11 +186,11 @@ func TestNormalizeSlashNamesDedupesAndSorts(t *testing.T) {
 
 func TestParseSlashCommand(t *testing.T) {
 	tests := []struct {
-		in         string
-		wantOK     bool
-		wantName   string
-		wantArgs   string
-		wantRaw    string
+		in       string
+		wantOK   bool
+		wantName string
+		wantArgs string
+		wantRaw  string
 	}{
 		{"hello", false, "", "", ""},
 		{"/", true, "", "", "/"},
@@ -275,46 +275,70 @@ func TestSlashTabStep(t *testing.T) {
 	})
 }
 
+func TestSlashResponseHelpers(t *testing.T) {
+	sc := SlashCommand{Raw: "/foo bar", Name: "foo", Args: "bar"}
+	nr := sc.NewResponse("transformed")
+	if nr.Handled || nr.Response != "transformed" || nr.Command.Name != "foo" {
+		t.Fatalf("NewResponse: %+v", nr)
+	}
+	fw := sc.Forward()
+	if fw.Handled || fw.Response != "/foo bar" || fw.Command.Raw != "/foo bar" {
+		t.Fatalf("Forward: %+v", fw)
+	}
+	hd := sc.Handled()
+	if !hd.Handled || hd.Command.Name != "foo" {
+		t.Fatalf("Handled: %+v", hd)
+	}
+	var zero SlashResponse
+	if !zero.IsFallthrough() || !(SlashResponse{}).IsFallthrough() {
+		t.Fatal("zero SlashResponse should be fallthrough")
+	}
+	if (SlashResponse{Handled: true}).IsFallthrough() {
+		t.Fatal("non-zero should not be fallthrough")
+	}
+}
+
 func TestDispatchSlashCommand(t *testing.T) {
 	shell := New(Config{
 		SlashCommandNames: []string{"local"},
-		SlashCommandHandler: func(_ *App, sc SlashCommand) (bool, error) {
+		SlashCommandHandler: func(_ *App, sc SlashCommand) (SlashResponse, error) {
 			if sc.Name == "local" {
-				return true, nil
+				return sc.Handled(), nil
 			}
-			return false, nil
+			return SlashResponse{}, nil
 		},
 	})
 
-	stop, err := shell.dispatchSlashCommand("/local")
-	if !stop || err != nil {
-		t.Fatalf("dispatch /local: stop=%v err=%v", stop, err)
+	resp, _, path, err := shell.dispatchSlashCommand("/local")
+	if err != nil || !path || resp.IsFallthrough() || !resp.Handled {
+		t.Fatalf("dispatch /local: resp=%+v path=%v err=%v", resp, path, err)
 	}
 
-	stop, err = shell.dispatchSlashCommand("/other")
-	if stop || err != nil {
-		t.Fatalf("dispatch /other: stop=%v err=%v", stop, err)
+	resp, _, path, err = shell.dispatchSlashCommand("/other")
+	if err != nil || !path || !resp.IsFallthrough() {
+		t.Fatalf("dispatch /other: resp=%+v path=%v err=%v", resp, path, err)
 	}
 
-	stop, err = shell.dispatchSlashCommand("plain")
-	if stop {
-		t.Fatalf("non-slash: stop=%v", stop)
+	resp, _, path, err = shell.dispatchSlashCommand("plain")
+	if err != nil || path || !resp.IsFallthrough() {
+		t.Fatalf("non-slash: resp=%+v path=%v", resp, path)
 	}
 
 	errShell := New(Config{
-		SlashCommandHandler: func(_ *App, _ SlashCommand) (bool, error) {
-			return false, errors.New("slash err")
+		SlashCommandHandler: func(_ *App, _ SlashCommand) (SlashResponse, error) {
+			return SlashResponse{}, errors.New("slash err")
 		},
 	})
-	stop, err = errShell.dispatchSlashCommand("/x")
-	if !stop || err == nil {
-		t.Fatalf("dispatch error: stop=%v err=%v", stop, err)
+	resp, _, path, err = errShell.dispatchSlashCommand("/x")
+	if err == nil || !path {
+		t.Fatalf("dispatch error: err=%v path=%v", err, path)
 	}
+	_ = resp
 
 	none := New(Config{})
-	stop, err = none.dispatchSlashCommand("/x")
-	if stop || err != nil {
-		t.Fatalf("without handler: stop=%v err=%v", stop, err)
+	resp, _, path, err = none.dispatchSlashCommand("/x")
+	if err != nil || path || !resp.IsFallthrough() {
+		t.Fatalf("without handler: resp=%+v path=%v err=%v", resp, path, err)
 	}
 }
 
