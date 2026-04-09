@@ -205,6 +205,12 @@ type App struct {
 	slashLastTabPrefix string
 
 	textareaSizedWidth int // last width passed to NewTextArea; -1 = not yet synced from terminal
+
+	// streamInlineMaxHeight is the largest inline height seen during the active stream; while
+	// streaming, effectiveInlineHeight never returns below this (clamped to terminal height).
+	// Prevents SetInlineHeight from shrinking mid-stream when layout inputs change (meta line,
+	// slash hint, SetStatus text, etc.), which corrupts StreamAbove output on narrow TTYs.
+	streamInlineMaxHeight int
 }
 
 func New(config Config) *App {
@@ -489,6 +495,7 @@ func (a *App) startResponse(input string, slash SlashCommand, fromSlash bool) {
 		prevCancel()
 	}
 	a.streaming.Set(true)
+	a.streamInlineMaxHeight = 0
 
 	req := &Request{
 		Context:     reqCtx,
@@ -519,6 +526,7 @@ func (a *App) finishResponse(id uint64, err error) {
 		}
 
 		a.streaming.Set(false)
+		a.streamInlineMaxHeight = 0
 		if err != nil && !errors.Is(err, context.Canceled) {
 			a.app.PrintAboveln("%s", a.config.RenderError(err))
 		}
@@ -740,7 +748,22 @@ func (a *App) effectiveInlineHeight(app *tui.App) int {
 		return a.initialInlineHeight()
 	}
 	tw, th := app.Terminal().Size()
-	return a.computeInlineHeightForTerminal(tw, th)
+	h := a.computeInlineHeightForTerminal(tw, th)
+	if !a.streaming.Get() {
+		return h
+	}
+	if h > a.streamInlineMaxHeight {
+		a.streamInlineMaxHeight = h
+	}
+	thCap := th
+	if thCap > 0 && a.streamInlineMaxHeight > thCap {
+		a.streamInlineMaxHeight = thCap
+	}
+	use := a.streamInlineMaxHeight
+	if h < use {
+		return use
+	}
+	return h
 }
 
 func (a *App) computeInlineHeightForTerminal(termWidth, termHeight int) int {
@@ -755,10 +778,8 @@ func (a *App) computeInlineHeightForTerminal(termWidth, termHeight int) int {
 		rows += countWrappedLines(a.config.Title, inner)
 	}
 	rows += countWrappedLines(a.instructionsText(), inner)
-	rows += countWrappedLines(a.metaText(), inner)
-	if line := a.slashCommandsHintLine(); line != "" {
-		rows += countWrappedLines(line, inner)
-	}
+	rows += metaRowsForLayout(inner)
+	rows += a.slashCommandsHintRowsForLayout(inner)
 	rows += a.statusRowsForLayout(inner)
 	rows += a.textarea.Height()
 
@@ -824,8 +845,41 @@ func (a *App) instructionsText() string {
 	return strings.Join(parts, " ")
 }
 
+func metaLineForMode(mode string) string {
+	return fmt.Sprintf("Mode: %s | Ctrl+C or Esc exits", mode)
+}
+
 func (a *App) metaText() string {
-	return fmt.Sprintf("Mode: %s | Ctrl+C or Esc exits", a.modeLabel())
+	return metaLineForMode(a.modeLabel())
+}
+
+// metaRowsForLayout returns wrapped row count for the mode line using the larger of compact vs
+// multiline labels so inline height does not change when Tab toggles mode during streaming.
+func metaRowsForLayout(inner int) int {
+	c := countWrappedLines(metaLineForMode("compact"), inner)
+	m := countWrappedLines(metaLineForMode("multiline"), inner)
+	n := c
+	if m > n {
+		n = m
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// slashCommandsHintRowsForLayout reserves rows for the slash hint as if it were visible, so
+// height does not jump when the user types "/" during an active stream.
+func (a *App) slashCommandsHintRowsForLayout(inner int) int {
+	if len(a.config.SlashCommandNames) == 0 {
+		return 0
+	}
+	line := "Slash: " + strings.Join(a.config.SlashCommandNames, ", ")
+	n := countWrappedLines(line, inner)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func (a *App) modeLabel() string {

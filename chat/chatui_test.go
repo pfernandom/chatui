@@ -407,6 +407,46 @@ func TestDefaultRenderUserMessageDivider(t *testing.T) {
 	}
 }
 
+func TestMetaRowsForLayoutUsesMaxOfModes(t *testing.T) {
+	inner := 22
+	c := countWrappedLines(metaLineForMode("compact"), inner)
+	m := countWrappedLines(metaLineForMode("multiline"), inner)
+	want := c
+	if m > want {
+		want = m
+	}
+	if got := metaRowsForLayout(inner); got != want {
+		t.Fatalf("metaRowsForLayout(%d) = %d, want %d", inner, got, want)
+	}
+}
+
+func TestComputeInlineHeightForTerminal_metaAndSlashHintRowsStable(t *testing.T) {
+	cfg := normalizeConfig(Config{
+		Instructions:      "hi",
+		CompactHeight:     15,
+		MultilineHeight:   15,
+		DefaultMultiline:  false,
+		HandleResponse:    func(*Request) error { return nil },
+		SlashCommandNames: []string{"alpha", "bravo"},
+	})
+	shell := New(cfg)
+	tw := 80
+	hCompact := shell.computeInlineHeightForTerminal(tw, 100)
+	shell.multiline.Set(true)
+	hMulti := shell.computeInlineHeightForTerminal(tw, 100)
+	if hCompact != hMulti {
+		t.Fatalf("height varies with multiline mode: compact=%d multiline=%d", hCompact, hMulti)
+	}
+
+	shell2 := New(cfg)
+	hNoSlash := shell2.computeInlineHeightForTerminal(tw, 100)
+	shell2.textarea.SetText("/x")
+	hSlash := shell2.computeInlineHeightForTerminal(tw, 100)
+	if hNoSlash != hSlash {
+		t.Fatalf("height varies with slash hint: empty=%d withSlash=%d", hNoSlash, hSlash)
+	}
+}
+
 func TestStatusRowsForLayoutUsesMaxOfStreamingAndIdle(t *testing.T) {
 	shell := New(Config{})
 	inner := 32
