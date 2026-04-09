@@ -388,6 +388,100 @@ func TestApp_PrintAbovelnBeforeBindNoPanic(t *testing.T) {
 	shell.QueuePrintAboveln("%s", "b")
 }
 
+func TestDefaultRenderUserMessageDivider(t *testing.T) {
+	got := defaultRenderUserMessage("hi")
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %q", len(lines), got)
+	}
+	if lines[0] != "You: hi" {
+		t.Fatalf("line0 = %q", lines[0])
+	}
+	if len(lines[1]) < userMessageDividerMinWidth {
+		t.Fatalf("divider too short: %q", lines[1])
+	}
+	for _, r := range lines[1] {
+		if r != '─' {
+			t.Fatalf("divider should be light horizontal rules, got %q", lines[1])
+		}
+	}
+}
+
+func TestCountWrappedLines(t *testing.T) {
+	tests := []struct {
+		s     string
+		limit int
+		want  int
+	}{
+		{"", 10, 0},
+		{"hello", 10, 1},
+		{"abcdefghij", 10, 1},
+		{"abcdefghijk", 10, 2},
+		{"a\nb", 10, 2},
+	}
+	for _, tt := range tests {
+		if got := countWrappedLines(tt.s, tt.limit); got != tt.want {
+			t.Errorf("countWrappedLines(%q, %d) = %d, want %d", tt.s, tt.limit, got, tt.want)
+		}
+	}
+}
+
+func TestComputeInlineHeightForTerminal_clampMinMax(t *testing.T) {
+	longInstr := strings.Repeat("word ", 400)
+	shell := New(normalizeConfig(Config{
+		Instructions:     longInstr,
+		CompactHeight:    5,
+		MultilineHeight:  12,
+		DefaultMultiline: true,
+		HandleResponse:   func(*Request) error { return nil },
+	}))
+	// Narrow terminal => heavy wrapping; natural height >> 12; max clamp applies.
+	h := shell.computeInlineHeightForTerminal(32, 100)
+	if h != 12 {
+		t.Fatalf("expected max clamp 12, got %d", h)
+	}
+
+	shellSmall := New(normalizeConfig(Config{
+		Instructions:     "x",
+		CompactHeight:    25,
+		MultilineHeight:  40,
+		DefaultMultiline: true,
+		HandleResponse:   func(*Request) error { return nil },
+	}))
+	hSmall := shellSmall.computeInlineHeightForTerminal(120, 100)
+	if hSmall < 25 {
+		t.Fatalf("expected min clamp 25, got %d", hSmall)
+	}
+}
+
+func TestComputeInlineHeightForTerminal_compactModeMaxIsCompactHeight(t *testing.T) {
+	shell := New(normalizeConfig(Config{
+		Instructions:     "x",
+		CompactHeight:    9,
+		MultilineHeight:  30,
+		DefaultMultiline: false,
+		HandleResponse:   func(*Request) error { return nil },
+	}))
+	h := shell.computeInlineHeightForTerminal(200, 100)
+	if h > 9 {
+		t.Fatalf("compact mode max should be CompactHeight, got %d", h)
+	}
+}
+
+func TestComputeInlineHeightForTerminal_capsToTerminalHeight(t *testing.T) {
+	shell := New(normalizeConfig(Config{
+		Instructions:     "x",
+		CompactHeight:    4,
+		MultilineHeight:  80,
+		DefaultMultiline: true,
+		HandleResponse:   func(*Request) error { return nil },
+	}))
+	h := shell.computeInlineHeightForTerminal(200, 14)
+	if h > 14 {
+		t.Fatalf("expected cap at terminal height 14, got %d", h)
+	}
+}
+
 type recordingStream struct {
 	buf    bytes.Buffer
 	closed bool

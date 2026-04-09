@@ -8,13 +8,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	tui "github.com/pfernandom/go-tui"
 )
 
 const (
 	defaultPlaceholder = "Type a message. Enter sends. Ctrl+J adds a newline."
-	// Inline shell height (go-tui region); large enough for wrapped long lines + chrome.
+	// Default min (compact) and max (multiline) strip heights; actual height is computed from content.
 	defaultCompactHeight   = 10
 	defaultMultilineHeight = 20
 	// TextArea shows at most this many wrapped rows; higher avoids clipping long pasted lines.
@@ -24,6 +25,11 @@ const (
 	minTextAreaWidth      = 16
 	// Subtracted from terminal width when TextAreaWidth is 0 (auto).
 	termWidthGutter = 6
+	// chromePaddingRows is vertical cells used by root WithPadding(1) (top + bottom).
+	chromePaddingRows = 2
+	// initialTermWidth/initialTermHeight are used before BindApp for WithInlineHeight sizing.
+	initialTermWidth  = 80
+	initialTermHeight = 24
 )
 
 type Stream interface {
@@ -134,9 +140,13 @@ func ParseSlashCommand(trimmed string) (SlashCommand, bool) {
 }
 
 type Config struct {
-	Title            string
-	Placeholder      string
-	CompactHeight    int
+	Title       string
+	Placeholder string
+	// CompactHeight is the minimum height (terminal rows) of the inline strip and the
+	// maximum when multiline mode is off (compact layout).
+	CompactHeight int
+	// MultilineHeight is the maximum height of the inline strip when multiline mode is on.
+	// The shell grows between CompactHeight and MultilineHeight based on composer + chrome.
 	MultilineHeight  int
 	DefaultMultiline bool
 	// ComposerTextareaOptions are applied after built-in sizing, border, and placeholder.
@@ -148,7 +158,9 @@ type Config struct {
 	// If 0, defaultTextAreaMaxHeight is used. Override with ComposerTextareaOptions if needed.
 	TextAreaMaxHeight int
 
-	HandleResponse    ResponseHandler
+	HandleResponse ResponseHandler
+	// RenderUserMessage formats text printed above the widget before a response (often "You: …").
+	// The string may include newlines; the default appends a horizontal rule under the echo.
 	RenderUserMessage MessageRenderer
 	RenderError       ErrorRenderer
 
@@ -254,7 +266,7 @@ func (a *App) effectiveTextAreaWidth(termWidth int) int {
 
 func (a *App) Start(opts ...tui.AppOption) (*tui.App, error) {
 	base := []tui.AppOption{
-		tui.WithInlineHeight(a.inlineHeight()),
+		tui.WithInlineHeight(a.initialInlineHeight()),
 		tui.WithRootComponent(a),
 	}
 	opts = append(base, opts...)
@@ -373,13 +385,12 @@ func (a *App) Render(app *tui.App) *tui.Element {
 		return a.renderOverlay(a.config.HelpView, "Help")
 	}
 
-	app.SetInlineHeight(a.inlineHeight())
+	app.SetInlineHeight(a.effectiveInlineHeight(app))
 
 	root := tui.New(
 		tui.WithDisplay(tui.DisplayFlex),
 		tui.WithDirection(tui.Column),
 		tui.WithPadding(1),
-		tui.WithHeightPercent(100),
 	)
 
 	if a.config.Title != "" {
@@ -699,11 +710,96 @@ func (a *App) closeOverlay() {
 	a.showHelp.Set(false)
 }
 
-func (a *App) inlineHeight() int {
-	if a.multiline.Get() {
-		return a.config.MultilineHeight
+// inlineStripBounds returns min and max allowed inline strip heights in rows.
+func (a *App) inlineStripBounds() (minH, maxH int) {
+	minH = a.config.CompactHeight
+	maxH = a.config.MultilineHeight
+	if !a.multiline.Get() {
+		maxH = a.config.CompactHeight
 	}
-	return a.config.CompactHeight
+	if minH < 1 {
+		minH = 1
+	}
+	if maxH < minH {
+		maxH = minH
+	}
+	return minH, maxH
+}
+
+// initialInlineHeight selects a strip height before the terminal is bound (Start/NewApp).
+func (a *App) initialInlineHeight() int {
+	return a.computeInlineHeightForTerminal(initialTermWidth, initialTermHeight)
+}
+
+// effectiveInlineHeight returns the strip height for the current layout and terminal.
+func (a *App) effectiveInlineHeight(app *tui.App) int {
+	if app == nil {
+		return a.initialInlineHeight()
+	}
+	tw, th := app.Terminal().Size()
+	return a.computeInlineHeightForTerminal(tw, th)
+}
+
+func (a *App) computeInlineHeightForTerminal(termWidth, termHeight int) int {
+	minH, maxH := a.inlineStripBounds()
+	inner := termWidth - 2 // root WithPadding(1) left+right
+	if inner < 1 {
+		inner = 1
+	}
+
+	rows := chromePaddingRows
+	if a.config.Title != "" {
+		rows += countWrappedLines(a.config.Title, inner)
+	}
+	rows += countWrappedLines(a.instructionsText(), inner)
+	rows += countWrappedLines(a.metaText(), inner)
+	if line := a.slashCommandsHintLine(); line != "" {
+		rows += countWrappedLines(line, inner)
+	}
+	rows += countWrappedLines(a.statusText(), inner)
+	rows += a.textarea.Height()
+
+	if rows < minH {
+		rows = minH
+	}
+	if rows > maxH {
+		rows = maxH
+	}
+	if termHeight > 0 && rows > termHeight {
+		rows = termHeight
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	return rows
+}
+
+// countWrappedLines returns how many terminal rows text needs when wrapped at rune limit per line.
+// Empty string contributes 0 rows. Paragraphs are split on '\n' and each wrapped like [ComposerTextArea.wrapText].
+func countWrappedLines(s string, limit int) int {
+	if s == "" {
+		return 0
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	total := 0
+	for _, para := range strings.Split(s, "\n") {
+		if para == "" {
+			total++
+			continue
+		}
+		current := 0
+		for range []rune(para) {
+			if current >= limit {
+				total++
+				current = 0
+			}
+			current++
+		}
+		total++
+	}
+	return total
 }
 
 func (a *App) instructionsText() string {
@@ -775,6 +871,23 @@ func (a *App) renderOverlay(view OverlayView, fallbackTitle string) *tui.Element
 	return root
 }
 
+// userMessageDividerMinWidth is the minimum rune length of the rule under the user echo.
+const userMessageDividerMinWidth = 12
+
+// defaultRenderUserMessage prints the user line(s) and a horizontal rule below so the
+// following streamed reply is visually separated from the echo.
+func defaultRenderUserMessage(input string) string {
+	msg := fmt.Sprintf("You: %s", input)
+	maxw := userMessageDividerMinWidth
+	for _, line := range strings.Split(msg, "\n") {
+		if n := utf8.RuneCountInString(line); n > maxw {
+			maxw = n
+		}
+	}
+	div := strings.Repeat("─", maxw)
+	return msg + "\n" + div
+}
+
 func normalizeConfig(config Config) Config {
 	cfg := config
 	if cfg.Placeholder == "" {
@@ -796,9 +909,7 @@ func normalizeConfig(config Config) Config {
 		}
 	}
 	if cfg.RenderUserMessage == nil {
-		cfg.RenderUserMessage = func(input string) string {
-			return fmt.Sprintf("You: %s", input)
-		}
+		cfg.RenderUserMessage = defaultRenderUserMessage
 	}
 	if cfg.RenderError == nil {
 		cfg.RenderError = func(err error) string {

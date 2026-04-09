@@ -67,3 +67,5 @@ For pull requests, include:
 ## Architecture Notes
 
 `chat` owns the inline-mode shell, request lifecycle, streaming, and status line behavior. Callers provide response handlers and optional overlay views; demos should consume that API rather than duplicating shell logic.
+
+**Inline strip sizing:** `Config.CompactHeight` is the minimum height in rows (and the maximum when multiline mode is off). `Config.MultilineHeight` is the maximum height when multiline mode is on. The shell computes the actual inline height from padding, title, wrapped instructions/meta/status/slash hint, and the composer, then clamps to those bounds and to the terminal height.
