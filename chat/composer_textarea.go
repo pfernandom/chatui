@@ -5,7 +5,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	tui "github.com/grindlemire/go-tui"
+	tui "github.com/pfernandom/go-tui"
 )
 
 // keyPatternMatches mirrors go-tui dispatchEntry.matchesKey for [ComposerTextArea.HandleEvent].

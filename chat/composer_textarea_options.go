@@ -1,6 +1,6 @@
 package chat
 
-import tui "github.com/grindlemire/go-tui"
+import tui "github.com/pfernandom/go-tui"
 
 // ComposerTextareaOption configures a [ComposerTextArea].
 type ComposerTextareaOption func(*ComposerTextArea)

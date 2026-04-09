@@ -7,7 +7,7 @@ import (
 
 	"github.com/pfernandom/chatui/chat"
 
-	tui "github.com/grindlemire/go-tui"
+	tui "github.com/pfernandom/go-tui"
 )
 
 var botGradient = tui.NewGradient(tui.BrightCyan, tui.BrightMagenta)

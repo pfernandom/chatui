@@ -1,2 +1,4 @@
-golang.org/x/sys v0.42.0 h1:omrd2nAlyT5ESRdCLYdm3+fMfNFE/+Rf4bDIQImRJeo=
-golang.org/x/sys v0.42.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+github.com/pfernandom/go-tui v0.0.0-20260409164441-2f3c797a865a h1:353NRN+BlIPdtMaU/mDMDoExLfF1gib6YPRTbKJoDak=
+github.com/pfernandom/go-tui v0.0.0-20260409164441-2f3c797a865a/go.mod h1:7Auryi6hcfS5tnrZm2Gpq8ktKrDW79qOqYiXa0F+cKE=
+golang.org/x/sys v0.40.0 h1:DBZZqJ2Rkml6QMQsZywtnjnnGvHza6BTfYFWY9kjEWQ=
+golang.org/x/sys v0.40.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	tui "github.com/grindlemire/go-tui"
+	tui "github.com/pfernandom/go-tui"
 )
 
 func TestNormalizeConfigDefaults(t *testing.T) {

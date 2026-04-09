@@ -1,3 +1,0 @@
-[submodule "deps/go-tui"]
-	path = deps/go-tui
-	url = https://github.com/pfernandom/go-tui.git

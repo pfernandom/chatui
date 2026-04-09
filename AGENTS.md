@@ -2,13 +2,12 @@
 
 ## Project Structure & Module Organization
 
-This repository is a small Go module centered on a reusable inline chat shell built on `go-tui`.
+This repository is a small Go module centered on a reusable inline chat shell built on [github.com/pfernandom/go-tui](https://github.com/pfernandom/go-tui) (a fork of [grindlemire/go-tui](https://github.com/grindlemire/go-tui)).
 
 - `main.go`: primary demo app using the reusable `chat` package
 - `chat/`: reusable package code and tests
 - `cmd/simple-chat/`, `cmd/simple-chat-2/`: alternative runnable examples
 - `go.mod`, `go.sum`: module definition and dependencies
-- `deps/go-tui`: git submodule ([github.com/pfernandom/go-tui](https://github.com/pfernandom/go-tui)), a fork of `github.com/grindlemire/go-tui` with any chatui-specific fixes
 
 Keep reusable behavior in `chat/`. Reserve `main.go` and `cmd/` programs for demos or integration examples.
 
@@ -16,13 +15,7 @@ Keep reusable behavior in `chat/`. Reserve `main.go` and `cmd/` programs for dem
 
 Do not commit a `vendor/` tree or loose copies of third-party module sources in the tree.
 
-`go-tui` is consumed via a **git submodule** at `deps/go-tui` and a `replace` in `go.mod` that points `github.com/grindlemire/go-tui` at that path (import paths stay `github.com/grindlemire/go-tui`). After cloning chatui, run:
-
-```bash
-git submodule update --init --recursive
-```
-
-Changes to the fork are made inside `deps/go-tui`, committed there, and pushed to [pfernandom/go-tui](https://github.com/pfernandom/go-tui); the parent repo records the submodule commit SHA. The fork keeps `module github.com/grindlemire/go-tui`, so imports stay unchanged and the `replace` directive is the supported way to build this repo. Tag the fork when you want a named revision (for example after merging fixes).
+Terminal UI comes from **`github.com/pfernandom/go-tui`** as a normal module dependency (`go.mod` / `go.sum`). Consumers only need `go mod download`; no `replace` and no submodule. Fixes and releases are developed in the fork repository; bump the version here with `go get github.com/pfernandom/go-tui@vx.y.z` (or `@main` / a commit pseudo-version while iterating).
 
 ## Build, Test, and Development Commands
 

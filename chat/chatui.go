@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	tui "github.com/grindlemire/go-tui"
+	tui "github.com/pfernandom/go-tui"
 )
 
 const (

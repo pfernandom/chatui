@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tui "github.com/grindlemire/go-tui"
+	tui "github.com/pfernandom/go-tui"
 )
 
 func TestComposerTextarea_Render_MaxHeightLimitsChildren(t *testing.T) {
