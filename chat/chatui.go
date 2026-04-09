@@ -139,12 +139,13 @@ type Config struct {
 	CompactHeight    int
 	MultilineHeight  int
 	DefaultMultiline bool
-	TextAreaOptions  []tui.TextAreaOption
+	// ComposerTextareaOptions are applied after built-in sizing, border, and placeholder.
+	ComposerTextareaOptions []ComposerTextareaOption
 	// TextAreaWidth is the composer width in terminal cells. If 0, width is set at BindApp
 	// from the terminal size (minus a small gutter) so the field fits narrow windows.
 	TextAreaWidth int
-	// TextAreaMaxHeight is the maximum number of visible wrapped rows (go-tui TextArea).
-	// If 0, defaultTextAreaMaxHeight is used. Override with TextAreaOptions if needed.
+	// TextAreaMaxHeight is the maximum number of visible wrapped rows ([ComposerTextArea]).
+	// If 0, defaultTextAreaMaxHeight is used. Override with ComposerTextareaOptions if needed.
 	TextAreaMaxHeight int
 
 	HandleResponse    ResponseHandler
@@ -174,7 +175,7 @@ type App struct {
 	showHelp     *tui.State[bool]
 	multiline    *tui.State[bool]
 	streaming    *tui.State[bool]
-	textarea     *tui.TextArea
+	textarea     *ComposerTextArea
 
 	mu             sync.Mutex
 	activeCancel   context.CancelFunc
@@ -213,26 +214,26 @@ func New(config Config) *App {
 		}
 	}
 
-	a.textarea = tui.NewTextArea(a.textAreaOptions(fallbackTextAreaWidth)...)
+	a.textarea = NewComposerTextarea(a.textAreaOptions(fallbackTextAreaWidth)...)
 
 	return a
 }
 
-// textAreaOptions builds TextArea options for a given content width in cells.
-func (a *App) textAreaOptions(width int) []tui.TextAreaOption {
+// textAreaOptions builds composer options for a given content width in cells.
+func (a *App) textAreaOptions(width int) []ComposerTextareaOption {
 	maxH := a.config.TextAreaMaxHeight
 	if maxH <= 0 { // defensive; normalizeConfig usually sets a positive default
 		maxH = defaultTextAreaMaxHeight
 	}
-	opts := []tui.TextAreaOption{
-		tui.WithTextAreaWidth(width),
-		tui.WithTextAreaMaxHeight(maxH),
-		tui.WithTextAreaBorder(tui.BorderRounded),
-		tui.WithTextAreaPlaceholder(a.config.Placeholder),
-		tui.WithTextAreaAutoFocus(true),
+	opts := []ComposerTextareaOption{
+		ComposerWidth(width),
+		ComposerMaxHeight(maxH),
+		ComposerBorder(tui.BorderRounded),
+		ComposerPlaceholder(a.config.Placeholder),
+		ComposerAutoFocus(true),
 	}
-	opts = append(opts, a.config.TextAreaOptions...)
-	opts = append(opts, tui.WithTextAreaOnSubmit(a.send))
+	opts = append(opts, a.config.ComposerTextareaOptions...)
+	opts = append(opts, ComposerOnSubmit(a.send))
 	return opts
 }
 
@@ -279,7 +280,7 @@ func (a *App) BindApp(app *tui.App) {
 		if a.textarea != nil {
 			preserved = a.textarea.Text()
 		}
-		a.textarea = tui.NewTextArea(a.textAreaOptions(wantW)...)
+		a.textarea = NewComposerTextarea(a.textAreaOptions(wantW)...)
 		if preserved != "" {
 			a.textarea.SetText(preserved)
 		}
