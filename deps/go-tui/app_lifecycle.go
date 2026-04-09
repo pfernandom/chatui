@@ -1,0 +1,366 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/grindlemire/go-tui/internal/debug"
+)
+
+// SnapshotFrame returns the current frame as a string for debugging.
+func (a *App) SnapshotFrame() string {
+	if a.buffer != nil {
+		return a.buffer.StringTrimmed()
+	}
+	return ""
+}
+
+// Close restores the terminal to its original state.
+// Must be called when the application exits. Safe to call multiple times.
+func (a *App) Close() error {
+	var closeErr error
+	a.closeOnce.Do(func() {
+		// Stop goroutines if not already stopped
+		a.Stop()
+
+		// Clean up signal handlers
+		if a.signalCleanup != nil {
+			a.signalCleanup()
+		}
+
+		// Disable mouse event reporting (only if it was enabled)
+		if a.mouseEnabled {
+			a.terminal.DisableMouse()
+		}
+
+		// Show cursor (only if it was hidden)
+		if !a.cursorVisible {
+			a.terminal.ShowCursor()
+		}
+
+		// Handle screen cleanup based on mode
+		if a.inAlternateScreen {
+			// Currently in alternate screen overlay: exit alternate screen first
+			a.terminal.ExitAltScreen()
+			// Then handle based on the original mode (before entering alternate)
+			if a.savedInlineHeight > 0 {
+				// Was inline mode: clear the inline area
+				a.terminal.SetCursor(0, a.savedInlineStartRow)
+				a.terminal.ClearToEnd()
+			}
+			// If savedInlineHeight == 0, we were in full-screen mode which means
+			// alternate screen was the normal state, so exiting it is sufficient
+		} else if a.inlineHeight > 0 {
+			// Inline mode: clear the widget area and position cursor for shell
+			a.terminal.SetCursor(0, a.inlineStartRow)
+			a.terminal.ClearToEnd()
+		} else {
+			// Full screen mode: exit alternate screen
+			a.terminal.ExitAltScreen()
+		}
+
+		// Disable Kitty keyboard protocol (pop from stack)
+		a.terminal.DisableKittyKeyboard()
+
+		// Exit raw mode
+		if err := a.terminal.ExitRawMode(); err != nil {
+			if a.reader != nil {
+				a.reader.Close()
+			}
+			closeErr = err
+			return
+		}
+
+		// Close EventReader
+		if a.reader != nil {
+			closeErr = a.reader.Close()
+		}
+	})
+	return closeErr
+}
+
+// PrintAbove prints content that scrolls up above the inline widget.
+// Does not add a trailing newline. Use PrintAboveln for auto-newline.
+// Only works in inline mode (WithInlineHeight). In full-screen mode, this is a no-op.
+// Must be called from the app's main loop.
+func (a *App) PrintAbove(format string, args ...any) {
+	a.printAboveFormatted(false, false, format, args...)
+}
+
+// QueuePrintAbove queues content to print above the inline widget without a
+// trailing newline.
+// Safe to call from any goroutine.
+func (a *App) QueuePrintAbove(format string, args ...any) {
+	a.printAboveFormatted(true, false, format, args...)
+}
+
+// PrintAboveln prints content with a trailing newline that scrolls up above the inline widget.
+// Only works in inline mode (WithInlineHeight). In full-screen mode, this is a no-op.
+// Must be called from the app's main loop.
+func (a *App) PrintAboveln(format string, args ...any) {
+	a.printAboveFormatted(false, true, format, args...)
+}
+
+// QueuePrintAboveln queues content with a trailing newline that scrolls up
+// above the inline widget.
+// Safe to call from any goroutine.
+func (a *App) QueuePrintAboveln(format string, args ...any) {
+	a.printAboveFormatted(true, true, format, args...)
+}
+
+// PrintAboveAsync queues content above the inline widget without a trailing
+// newline.
+// Deprecated: use QueuePrintAbove.
+func (a *App) PrintAboveAsync(format string, args ...any) {
+	a.QueuePrintAbove(format, args...)
+}
+
+// PrintAbovelnAsync queues content with a trailing newline that scrolls up
+// above the inline widget.
+// Deprecated: use QueuePrintAboveln.
+func (a *App) PrintAbovelnAsync(format string, args ...any) {
+	a.QueuePrintAboveln(format, args...)
+}
+
+func (a *App) printAboveFormatted(async, trailingNewline bool, format string, args ...any) {
+	if a.inlineHeight == 0 {
+		return
+	}
+
+	content := fmt.Sprintf(format, args...)
+	if trailingNewline {
+		content += "\n"
+	}
+
+	if async {
+		a.QueueUpdate(func() {
+			a.printAboveRaw(content)
+		})
+		return
+	}
+
+	a.printAboveRaw(content)
+}
+
+// PrintAboveStyled prints content that may contain ANSI escape sequences
+// above the inline widget. ANSI sequences are preserved for styled output.
+// Only works in inline mode (WithInlineHeight). In full-screen mode, this is a no-op.
+// Must be called from the app's main loop.
+func (a *App) PrintAboveStyled(format string, args ...any) {
+	a.printAboveStyledFormatted(false, false, format, args...)
+}
+
+// PrintAboveStyledln prints styled content with a trailing newline above the inline widget.
+// ANSI escape sequences are preserved. Must be called from the app's main loop.
+func (a *App) PrintAboveStyledln(format string, args ...any) {
+	a.printAboveStyledFormatted(false, true, format, args...)
+}
+
+// QueuePrintAboveStyled queues styled content to print above the inline widget.
+// ANSI escape sequences are preserved. Safe to call from any goroutine.
+func (a *App) QueuePrintAboveStyled(format string, args ...any) {
+	a.printAboveStyledFormatted(true, false, format, args...)
+}
+
+// QueuePrintAboveStyledln queues styled content with a trailing newline.
+// ANSI escape sequences are preserved. Safe to call from any goroutine.
+func (a *App) QueuePrintAboveStyledln(format string, args ...any) {
+	a.printAboveStyledFormatted(true, true, format, args...)
+}
+
+func (a *App) printAboveStyledFormatted(async, trailingNewline bool, format string, args ...any) {
+	if a.inlineHeight == 0 {
+		return
+	}
+
+	content := fmt.Sprintf(format, args...)
+	if trailingNewline {
+		content += "\n"
+	}
+
+	if async {
+		a.QueueUpdate(func() {
+			a.printAboveStyledRaw(content)
+		})
+		return
+	}
+
+	a.printAboveStyledRaw(content)
+}
+
+func (a *App) printAboveStyledRaw(content string) {
+	if a.inlineStartRow < 1 {
+		return
+	}
+	a.ensureInlineSession()
+	a.inlineSession.ensureInitialized(&a.inlineLayout, a.inlineStartRow)
+
+	// Finalize any in-progress streaming partial line first.
+	a.inlineSession.finalizePartial(&a.inlineLayout)
+
+	width, _ := a.terminal.Size()
+	a.inlineSession.appendStyledText(&a.inlineLayout, a.inlineStartRow, width, content)
+
+	a.MarkDirty()
+}
+
+// PrintAboveElement renders a Viewable and inserts the resulting rows into
+// the inline scrollback. The element is rendered at the terminal's current width
+// and baked into static ANSI text. This is useful for inserting structured
+// content (tables, styled cards, templ component output) into the scrollback.
+// No-op if not in inline mode.
+// Must be called from the app's main event loop.
+func (a *App) PrintAboveElement(v Viewable) {
+	if a.inlineHeight == 0 || v == nil {
+		return
+	}
+	el := v.GetRoot()
+	if el == nil {
+		return
+	}
+	if a.inlineStartRow < 1 {
+		return
+	}
+	a.ensureInlineSession()
+	a.inlineSession.ensureInitialized(&a.inlineLayout, a.inlineStartRow)
+
+	// Finalize any in-progress streaming partial line first.
+	a.inlineSession.finalizePartial(&a.inlineLayout)
+
+	width, _ := a.terminal.Size()
+	caps := a.terminal.Caps()
+	buf, height := renderElementToBuffer(el, width, caps)
+	if height == 0 {
+		return
+	}
+
+	esc := newEscBuilder(256)
+	var seq strings.Builder
+	for row := 0; row < height; row++ {
+		line := bufferRowToANSI(buf, row, esc, caps)
+		a.inlineSession.appendRow(&seq, &a.inlineLayout, line)
+	}
+
+	if seq.Len() > 0 {
+		a.terminal.WriteDirect([]byte(seq.String()))
+	}
+
+	a.MarkDirty()
+}
+
+// QueuePrintAboveElement is the goroutine-safe version of PrintAboveElement.
+// The element is rendered and inserted on the main event loop.
+// Safe to call from any goroutine.
+func (a *App) QueuePrintAboveElement(v Viewable) {
+	if a.inlineHeight == 0 || v == nil {
+		return
+	}
+	a.QueueUpdate(func() {
+		a.PrintAboveElement(v)
+	})
+}
+
+// SetInlineHeight changes the inline widget height at runtime.
+// Only works in inline mode (WithInlineHeight was used at creation).
+// The height change takes effect immediately.
+// Should be called from render functions or the main event loop.
+func (a *App) SetInlineHeight(rows int) {
+	if a.inlineHeight == 0 {
+		return // Not in inline mode
+	}
+	if rows < 1 {
+		rows = 1
+	}
+
+	// Get current terminal size
+	width, termHeight := a.terminal.Size()
+
+	// Cap to terminal height
+	if rows > termHeight {
+		rows = termHeight
+	}
+
+	// Only update if height actually changed
+	if rows == a.inlineHeight {
+		debug.Log("SetInlineHeight: no change needed (already %d)", rows)
+		return
+	}
+
+	oldHeight := a.inlineHeight
+	oldStartRow := a.inlineStartRow
+	newStartRow := termHeight - rows
+
+	debug.Log("SetInlineHeight: changing from %d to %d (termHeight=%d, width=%d)", oldHeight, rows, termHeight, width)
+	a.ensureInlineSession()
+	a.inlineSession.ensureInitialized(&a.inlineLayout, oldStartRow)
+	a.inlineSession.resize(&a.inlineLayout, oldStartRow, oldHeight, newStartRow)
+
+	a.inlineHeight = rows
+	a.inlineStartRow = newStartRow
+	a.buffer.Resize(width, rows)
+	a.needsFullRedraw = true // Terminal position shifted, need full redraw
+	debug.Log("SetInlineHeight: buffer resized, new inlineStartRow=%d, needsFullRedraw=true", a.inlineStartRow)
+}
+
+// InlineHeight returns the current inline height (0 if not in inline mode).
+func (a *App) InlineHeight() int {
+	return a.inlineHeight
+}
+
+// printAboveRaw handles the actual printing and scrolling for inline mode.
+// Prints content that scrolls into terminal scrollback buffer, allowing
+// the user to scroll back through history with their terminal's scroll feature.
+// Must be called from the main event loop.
+func (a *App) printAboveRaw(content string) {
+	if a.inlineStartRow < 1 {
+		return // No room above widget
+	}
+	a.ensureInlineSession()
+	a.inlineSession.ensureInitialized(&a.inlineLayout, a.inlineStartRow)
+
+	// Finalize any in-progress streaming partial line first.
+	a.inlineSession.finalizePartial(&a.inlineLayout)
+
+	width, _ := a.terminal.Size()
+	a.inlineSession.appendText(&a.inlineLayout, a.inlineStartRow, width, content)
+
+	// Mark dirty to ensure consistent state
+	a.MarkDirty()
+}
+
+func (a *App) ensureInlineSession() {
+	if a.inlineSession == nil {
+		a.inlineSession = newInlineSession(a.terminal)
+	}
+}
+
+// StreamAbove returns a *StreamWriter that streams text character-by-character
+// to the history region above the inline widget. The writer implements
+// io.WriteCloser for plain byte streaming, and additionally provides
+// WriteStyled and WriteGradient methods for styled output.
+// Closing the writer finalizes the current line.
+// Returns a no-op writer if not in inline mode.
+// The writer is goroutine-safe.
+func (a *App) StreamAbove() *StreamWriter {
+	if a.inlineHeight == 0 {
+		return &StreamWriter{w: &nopStreamWriter{}, nop: true}
+	}
+
+	// Finalize any existing stream writer.
+	if a.activeStreamWriter != nil {
+		a.ensureInlineSession()
+		a.inlineSession.finalizePartial(&a.inlineLayout)
+		a.activeStreamWriter.closed.Store(true)
+	}
+
+	inner := newInlineStreamWriter(a)
+	a.activeStreamWriter = inner
+
+	width, _ := a.terminal.Size()
+	return &StreamWriter{
+		w:     inner,
+		app:   a,
+		width: width,
+		caps:  a.terminal.Caps(),
+	}
+}

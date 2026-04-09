@@ -1,0 +1,104 @@
+{
+  "name": "go-tui",
+  "displayName": "go-tui",
+  "description": "Syntax highlighting and LSP support for .gsx files (go-tui DSL)",
+  "version": "0.11.0",
+  "publisher": "grindlemire",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grindlemire/go-tui"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "icon": "./icons/icon-dark.png",
+  "keywords": [
+    "gsx",
+    "go-tui",
+    "terminal",
+    "ui",
+    "dsl"
+  ],
+  "activationEvents": [
+    "onLanguage:gsx"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "gsx",
+        "aliases": [
+          "GSX",
+          "gsx"
+        ],
+        "extensions": [
+          ".gsx"
+        ],
+        "icon": {
+          "light": "./icons/gsx-file-light.svg",
+          "dark": "./icons/gsx-file-dark.svg"
+        },
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gsx",
+        "scopeName": "source.gsx",
+        "path": "./syntaxes/gsx.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.go": "go"
+        }
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "GSX Language Server",
+      "properties": {
+        "gsx.lsp.path": {
+          "type": "string",
+          "default": "tui",
+          "description": "Path to the tui CLI binary (must be in PATH or an absolute path)"
+        },
+        "gsx.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the GSX language server"
+        },
+        "gsx.lsp.logPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to LSP log file for debugging (e.g., /tmp/gsx-lsp.log)"
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[gsx]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "editor.semanticTokenColorCustomizations": {
+        "rules": {
+          "typeParameter:gsx": "#C586C0"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "bunx @vscode/vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,361 @@
+package formatter
+
+import (
+	"go/format"
+	"strings"
+
+	"github.com/grindlemire/go-tui/internal/tuigen"
+)
+
+// printForLoop outputs a for loop.
+func (p *printer) printForLoop(f *tuigen.ForLoop) {
+	// Leading comments
+	p.printLeadingComments(f.LeadingComments)
+
+	p.writeIndent()
+	p.write("for ")
+
+	// Loop variables
+	if f.Index != "" {
+		p.write(f.Index)
+		p.write(", ")
+	}
+	p.write(f.Value)
+	p.write(" := range ")
+	p.write(f.Iterable)
+	p.write(" {")
+	p.printTrailingComment(f.TrailingComments)
+	p.newline()
+
+	// Body
+	p.depth++
+	p.printOrphanComments(f.OrphanComments)
+	p.printBody(f.Body)
+	p.depth--
+
+	p.writeIndent()
+	p.write("}")
+	p.newline()
+}
+
+// printIfStmt outputs an if statement.
+func (p *printer) printIfStmt(stmt *tuigen.IfStmt) {
+	// Leading comments
+	p.printLeadingComments(stmt.LeadingComments)
+
+	p.writeIndent()
+	p.write("if ")
+	p.write(stmt.Condition)
+	p.write(" {")
+	p.printTrailingComment(stmt.TrailingComments)
+	p.newline()
+
+	// Then branch
+	p.depth++
+	p.printOrphanComments(stmt.OrphanComments)
+	p.printBody(stmt.Then)
+	p.depth--
+
+	// Else branch
+	if len(stmt.Else) > 0 {
+		p.writeIndent()
+		p.write("} else ")
+
+		// Check for else-if chain
+		if len(stmt.Else) == 1 {
+			if elseIf, ok := stmt.Else[0].(*tuigen.IfStmt); ok {
+				// Print else-if without extra indent
+				p.write("if ")
+				p.write(elseIf.Condition)
+				p.write(" {")
+				p.printTrailingComment(elseIf.TrailingComments)
+				p.newline()
+
+				p.depth++
+				p.printOrphanComments(elseIf.OrphanComments)
+				p.printBody(elseIf.Then)
+				p.depth--
+
+				if len(elseIf.Else) > 0 {
+					p.printElseBranch(elseIf.Else)
+				} else {
+					p.writeIndent()
+					p.write("}")
+					p.newline()
+				}
+				return
+			}
+		}
+
+		// Regular else
+		p.write("{")
+		p.newline()
+		p.depth++
+		p.printBody(stmt.Else)
+		p.depth--
+		p.writeIndent()
+		p.write("}")
+		p.newline()
+	} else {
+		p.writeIndent()
+		p.write("}")
+		p.newline()
+	}
+}
+
+// printElseBranch handles recursive else-if chains.
+func (p *printer) printElseBranch(nodes []tuigen.Node) {
+	p.writeIndent()
+	p.write("} else ")
+
+	if len(nodes) == 1 {
+		if elseIf, ok := nodes[0].(*tuigen.IfStmt); ok {
+			p.write("if ")
+			p.write(elseIf.Condition)
+			p.write(" {")
+			p.printTrailingComment(elseIf.TrailingComments)
+			p.newline()
+
+			p.depth++
+			p.printOrphanComments(elseIf.OrphanComments)
+			p.printBody(elseIf.Then)
+			p.depth--
+
+			if len(elseIf.Else) > 0 {
+				p.printElseBranch(elseIf.Else)
+			} else {
+				p.writeIndent()
+				p.write("}")
+				p.newline()
+			}
+			return
+		}
+	}
+
+	p.write("{")
+	p.newline()
+	p.depth++
+	p.printBody(nodes)
+	p.depth--
+	p.writeIndent()
+	p.write("}")
+	p.newline()
+}
+
+// printLetBinding outputs a let binding using := syntax.
+func (p *printer) printLetBinding(let *tuigen.LetBinding) {
+	// Leading comments
+	p.printLeadingComments(let.LeadingComments)
+
+	p.writeIndent()
+
+	// Always emit :=
+	p.write(let.Name)
+	p.write(" := ")
+
+	if let.Call != nil {
+		p.write("@")
+		p.write(let.Call.Name)
+		p.write("(")
+		p.write(formatInlineBlockComments(let.Call.Args))
+		p.write(")")
+		p.newline()
+		return
+	}
+
+	if let.Expr != "" && let.Element == nil {
+		p.write("@")
+		p.write(let.Expr)
+		p.newline()
+		return
+	}
+
+	// Element RHS - print inline or multi-line
+	savedDepth := p.depth
+	p.depth = 0
+
+	p.buf.WriteString("<")
+	p.buf.WriteString(let.Element.Tag)
+
+	// Emit ref={expr} if present (extracted from attributes during parsing)
+	if let.Element.RefExpr != nil {
+		p.buf.WriteString(" ref={")
+		p.buf.WriteString(let.Element.RefExpr.Code)
+		p.buf.WriteString("}")
+	}
+
+	for _, attr := range let.Element.Attributes {
+		p.buf.WriteString(" ")
+		p.printAttribute(attr)
+	}
+
+	if let.Element.SelfClose {
+		p.buf.WriteString(" />")
+		p.newline()
+		p.depth = savedDepth
+		return
+	}
+
+	p.buf.WriteString(">")
+
+	// Check if children should be rendered inline (preserving user's source layout)
+	if let.Element.InlineChildren && p.canStructurallyInline(let.Element.Children) {
+		p.printChildrenInline(let.Element.Children)
+		p.buf.WriteString("</")
+		p.buf.WriteString(let.Element.Tag)
+		p.buf.WriteString(">")
+		p.newline()
+		p.depth = savedDepth
+		return
+	}
+
+	// Multi-line children
+	p.newline()
+	p.depth = savedDepth + 1
+	p.printBody(let.Element.Children)
+	p.depth = savedDepth
+	p.writeIndent()
+	p.buf.WriteString("</")
+	p.buf.WriteString(let.Element.Tag)
+	p.buf.WriteString(">")
+	p.newline()
+}
+
+// printComponentCall outputs a component call.
+func (p *printer) printComponentCall(call *tuigen.ComponentCall) {
+	// Leading comments
+	p.printLeadingComments(call.LeadingComments)
+
+	p.writeIndent()
+	p.write("@")
+	p.write(call.Name)
+	p.write("(")
+
+	if call.MultiLineArgs {
+		args := splitTopLevelArgs(call.Args)
+		p.newline()
+		p.depth++
+		for i, arg := range args {
+			p.writeIndent()
+			p.write(arg)
+			p.write(",")
+			if i < len(args)-1 {
+				p.newline()
+			}
+		}
+		p.depth--
+		p.newline()
+		p.writeIndent()
+	} else {
+		p.write(formatInlineBlockComments(call.Args))
+	}
+
+	p.write(")")
+
+	if len(call.Children) > 0 {
+		p.write(" {")
+		p.printTrailingComment(call.TrailingComments)
+		p.newline()
+
+		p.depth++
+		p.printBody(call.Children)
+		p.depth--
+
+		p.writeIndent()
+		p.write("}")
+	} else {
+		p.printTrailingComment(call.TrailingComments)
+	}
+	p.newline()
+}
+
+// splitTopLevelArgs splits a Go argument string by top-level commas,
+// respecting nested parentheses, brackets, braces, and string literals.
+func splitTopLevelArgs(args string) []string {
+	var result []string
+	depth := 0
+	inString := false
+	inRune := false
+	inBacktick := false
+	start := 0
+
+	for i := 0; i < len(args); i++ {
+		ch := args[i]
+		switch {
+		case inBacktick:
+			if ch == '`' {
+				inBacktick = false
+			}
+		case inString:
+			if ch == '\\' {
+				i++ // skip escaped char
+			} else if ch == '"' {
+				inString = false
+			}
+		case inRune:
+			if ch == '\\' {
+				i++
+			} else if ch == '\'' {
+				inRune = false
+			}
+		default:
+			switch ch {
+			case '"':
+				inString = true
+			case '\'':
+				inRune = true
+			case '`':
+				inBacktick = true
+			case '(', '[', '{':
+				depth++
+			case ')', ']', '}':
+				depth--
+			case ',':
+				if depth == 0 {
+					arg := strings.TrimSpace(args[start:i])
+					if arg != "" {
+						result = append(result, arg)
+					}
+					start = i + 1
+				}
+			}
+		}
+	}
+
+	// Last argument (may have trailing comma already trimmed by parser)
+	last := strings.TrimSpace(args[start:])
+	if last != "" {
+		result = append(result, last)
+	}
+
+	return result
+}
+
+// formatGoCode runs gofmt on a top-level Go declaration or function.
+func formatGoCode(code string) string {
+	wrapped := "package p\n\n" + code + "\n"
+	formatted, err := format.Source([]byte(wrapped))
+	if err != nil {
+		return code
+	}
+	result := string(formatted)
+	result = strings.TrimPrefix(result, "package p\n\n")
+	result = strings.TrimSuffix(result, "\n")
+	return result
+}
+
+// printGoFunc outputs a top-level Go function.
+func (p *printer) printGoFunc(fn *tuigen.GoFunc) {
+	p.printLeadingComments(fn.LeadingComments)
+	p.write(formatGoCode(fn.Code))
+	p.printTrailingComment(fn.TrailingComments)
+	p.newline()
+}
+
+// printGoDecl outputs a top-level Go declaration (type, const, var).
+func (p *printer) printGoDecl(decl *tuigen.GoDecl) {
+	p.printLeadingComments(decl.LeadingComments)
+	p.write(formatGoCode(decl.Code))
+	p.printTrailingComment(decl.TrailingComments)
+	p.newline()
+}

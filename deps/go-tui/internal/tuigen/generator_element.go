@@ -1,0 +1,566 @@
+package tuigen
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// generateElement generates code for an element and returns the variable name.
+// If parentVar is non-empty, adds this element as a child.
+func (g *Generator) generateElement(elem *Element, parentVar string) string {
+	return g.generateElementWithRefs(elem, parentVar, false, false, false)
+}
+
+// isComponentElement returns true if the tag represents a Component that
+// must be mounted via app.Mount() rather than constructed with tui.New().
+func isComponentElement(tag string) bool {
+	return tag == "textarea" || tag == "input" || tag == "modal"
+}
+
+// generateElementWithRefs generates code for an element with ref handling.
+// inLoop and inConditional track the context for proper variable handling.
+func (g *Generator) generateElementWithRefs(elem *Element, parentVar string, inLoop bool, inConditional bool, inForLoop bool) string {
+	if isComponentElement(elem.Tag) {
+		return g.generateComponentElementWithRefs(elem, parentVar, inLoop)
+	}
+
+	// All elements use auto-generated variable names now
+	varName := g.nextVar()
+
+	// Build options from attributes and tag
+	elemOpts := g.buildElementOptions(elem)
+
+	if len(elemOpts.options) == 0 {
+		g.writef("%s := tui.New()\n", varName)
+	} else {
+		g.writef("%s := tui.New(\n", varName)
+		g.indent++
+		for _, opt := range elemOpts.options {
+			g.writef("%s,\n", opt)
+		}
+		g.indent--
+		g.writeln(")")
+	}
+
+	// Handle ref binding — emit the appropriate Set/Append/Put call
+	if elem.RefExpr != nil {
+		refName := elem.RefExpr.Code
+		if elem.RefKey != nil {
+			// Map-based ref: put with key
+			g.writef("%s.Put(%s, %s)\n", refName, elem.RefKey.Code, varName)
+		} else if inLoop {
+			// List-based ref: append
+			g.writef("%s.Append(%s)\n", refName, varName)
+		} else {
+			// Single ref: set
+			g.writef("%s.Set(%s)\n", refName, varName)
+		}
+	}
+
+	// Generate children - skip if text element already has content in WithText
+	if !skipTextChildren(elem) {
+		g.generateChildrenWithRefs(varName, elem.Children, inLoop, inConditional, inForLoop)
+	}
+
+	// Add to parent if specified
+	if parentVar != "" {
+		g.writef("%s.AddChild(%s)\n", parentVar, varName)
+	}
+
+	return varName
+}
+
+// elementOptions holds options for an element.
+type elementOptions struct {
+	options []string
+}
+
+// buildElementOptions generates option expressions for an element.
+// Returns both element options and any watcher expressions found.
+func (g *Generator) buildElementOptions(elem *Element) elementOptions {
+	var result elementOptions
+
+	// Handle tag-specific options
+	switch elem.Tag {
+	case "hr":
+		result.options = append(result.options, "tui.WithHR()")
+	case "br":
+		result.options = append(result.options, "tui.WithWidth(0)")
+		result.options = append(result.options, "tui.WithHeight(1)")
+	case "span", "p":
+		// If text element has children that are text content, add WithText
+		textContent := g.extractTextContent(elem.Children)
+		if textContent != "" {
+			result.options = append(result.options, fmt.Sprintf("tui.WithText(%s)", textContent))
+		}
+	case "table":
+		result.options = append(result.options, `tui.WithTag("table")`)
+		result.options = append(result.options, "tui.WithDisplay(tui.DisplayFlex)")
+		result.options = append(result.options, "tui.WithDirection(tui.Column)")
+	case "tr":
+		result.options = append(result.options, `tui.WithTag("tr")`)
+		result.options = append(result.options, "tui.WithDisplay(tui.DisplayFlex)")
+		result.options = append(result.options, "tui.WithDirection(tui.Row)")
+	case "td":
+		result.options = append(result.options, `tui.WithTag("td")`)
+		textContent := g.extractTextContent(elem.Children)
+		if textContent != "" {
+			result.options = append(result.options, fmt.Sprintf("tui.WithText(%s)", textContent))
+		}
+	case "th":
+		result.options = append(result.options, `tui.WithTag("th")`)
+		textContent := g.extractTextContent(elem.Children)
+		if textContent != "" {
+			result.options = append(result.options, fmt.Sprintf("tui.WithText(%s)", textContent))
+		}
+	}
+
+	// Track text style methods from class attribute separately
+	var classTextMethods []string
+
+	// Generate options from attributes
+	for _, attr := range elem.Attributes {
+		// Handle class attribute specially - parse Tailwind classes
+		if attr.Name == "class" {
+			classValue := g.getClassAttributeValue(attr)
+			if classValue != "" {
+				twResult := ParseTailwindClasses(classValue)
+				// Add direct options
+				result.options = append(result.options, twResult.Options...)
+				// Collect text style methods for combining later
+				classTextMethods = append(classTextMethods, twResult.TextMethods...)
+			}
+			continue
+		}
+
+		// Handle handler attributes — emit as inline With* options (self-inject)
+		if optionFunc, isHandler := handlerAttributes[attr.Name]; isHandler {
+			handlerExpr := g.generateAttributeValue(attr.Value)
+			if handlerExpr != "" {
+				result.options = append(result.options, fmt.Sprintf("%s(%s)", optionFunc, handlerExpr))
+			}
+			continue
+		}
+
+		opt := g.generateAttributeOption(attr)
+		if opt != "" {
+			result.options = append(result.options, opt)
+		}
+	}
+
+	// Build combined text style from class attribute if any
+	if len(classTextMethods) > 0 {
+		textStyleOpt := BuildTextStyleOption(classTextMethods)
+		if textStyleOpt != "" {
+			result.options = append(result.options, textStyleOpt)
+		}
+	}
+
+	return result
+}
+
+// getClassAttributeValue extracts the string value from a class attribute.
+func (g *Generator) getClassAttributeValue(attr *Attribute) string {
+	switch v := attr.Value.(type) {
+	case *StringLit:
+		return v.Value
+	default:
+		// class attribute only supports string literals for now
+		return ""
+	}
+}
+
+// extractTextContent extracts text from element children for WithText.
+// Returns empty string if children contain non-text content.
+func (g *Generator) extractTextContent(children []Node) string {
+	if len(children) == 0 {
+		return ""
+	}
+
+	// If single GoExpr child, return the expression (wrapping numerics)
+	if len(children) == 1 {
+		if expr, ok := children[0].(*GoExpr); ok {
+			return textExpr(expr.Code)
+		}
+		if text, ok := children[0].(*TextContent); ok {
+			return strconv.Quote(text.Text)
+		}
+	}
+
+	// Multiple children or complex content - handled separately in generateChildren
+	return ""
+}
+
+// textExpr wraps a Go expression in fmt.Sprint() if it looks like a numeric literal.
+// This ensures numeric values are converted to strings for tui.WithText().
+// Detects: 42, 3.14, 0xFF, 0b1010, 0o755, -1, .5
+func textExpr(code string) string {
+	s := strings.TrimSpace(code)
+	if s == "" {
+		return code
+	}
+	// Strip optional leading minus
+	check := s
+	if len(check) > 0 && check[0] == '-' {
+		check = check[1:]
+	}
+	if len(check) == 0 {
+		return code
+	}
+	// If first char is a digit or '.', it's a numeric literal
+	if (check[0] >= '0' && check[0] <= '9') || check[0] == '.' {
+		return fmt.Sprintf("fmt.Sprint(%s)", s)
+	}
+	return code
+}
+
+// handlerAttributes maps focus callback attribute names to their With* option functions.
+// Handlers are emitted as inline options during element creation (self-inject pattern).
+var handlerAttributes = map[string]string{
+	"onFocus":    "tui.WithOnFocus",
+	"onBlur":     "tui.WithOnBlur",
+	"onActivate": "tui.WithOnActivate",
+}
+
+// attributeToOption maps DSL attribute names to tui.With* functions.
+var attributeToOption = map[string]string{
+	// Dimensions
+	"width":         "tui.WithWidth(%s)",
+	"widthPercent":  "tui.WithWidthPercent(%s)",
+	"height":        "tui.WithHeight(%s)",
+	"heightPercent": "tui.WithHeightPercent(%s)",
+	"minWidth":      "tui.WithMinWidth(%s)",
+	"minHeight":     "tui.WithMinHeight(%s)",
+	"maxWidth":      "tui.WithMaxWidth(%s)",
+	"maxHeight":     "tui.WithMaxHeight(%s)",
+
+	// Flex container
+	"direction": "tui.WithDirection(%s)",
+	"justify":   "tui.WithJustify(%s)",
+	"align":     "tui.WithAlign(%s)",
+	"gap":          "tui.WithGap(%s)",
+	"flexWrap":     "tui.WithFlexWrap(%s)",
+	"alignContent": "tui.WithAlignContent(%s)",
+
+	// Flex item
+	"flexGrow":   "tui.WithFlexGrow(%s)",
+	"flexShrink": "tui.WithFlexShrink(%s)",
+	"alignSelf":  "tui.WithAlignSelf(%s)",
+
+	// Spacing
+	"padding": "tui.WithPadding(%s)",
+	"margin":  "tui.WithMargin(%s)",
+
+	// Visual
+	"border":             "tui.WithBorder(%s)",
+	"borderStyle":        "tui.WithBorderStyle(%s)",
+	"background":         "tui.WithBackground(%s)",
+	"backgroundGradient": "tui.WithBackgroundGradient(%s)",
+
+	// Text
+	"text":      "tui.WithText(%s)",
+	"textStyle": "tui.WithTextStyle(%s)",
+	"textAlign": "tui.WithTextAlign(%s)",
+
+	// Focus (non-handler attributes only)
+	"focusable": "tui.WithFocusable(%s)",
+	"autoFocus": "tui.WithAutoFocus(%s)",
+
+	// Scroll
+	"scrollable":   "tui.WithScrollable(%s)",
+	"scrollOffset": "tui.WithScrollOffset(%s)",
+}
+
+// generateAttributeOption generates an option expression from an attribute.
+func (g *Generator) generateAttributeOption(attr *Attribute) string {
+	// Handle width="100%" and height="100%" percentage string syntax
+	if attr.Name == "width" || attr.Name == "height" {
+		if strLit, ok := attr.Value.(*StringLit); ok && strings.HasSuffix(strLit.Value, "%") {
+			numStr := strings.TrimSuffix(strLit.Value, "%")
+			if attr.Name == "width" {
+				return fmt.Sprintf("tui.WithWidthPercent(%s)", numStr)
+			}
+			return fmt.Sprintf("tui.WithHeightPercent(%s)", numStr)
+		}
+	}
+
+	template, ok := attributeToOption[attr.Name]
+	if !ok {
+		// Unknown attribute - skip with no error (analyzer should catch this)
+		return ""
+	}
+
+	value := g.generateAttributeValue(attr.Value)
+	return fmt.Sprintf(template, value)
+}
+
+// generateAttributeValue generates a Go expression from an attribute value.
+func (g *Generator) generateAttributeValue(value Node) string {
+	switch v := value.(type) {
+	case *StringLit:
+		return strconv.Quote(v.Value)
+	case *IntLit:
+		return strconv.FormatInt(v.Value, 10)
+	case *FloatLit:
+		return strconv.FormatFloat(v.Value, 'f', -1, 64)
+	case *BoolLit:
+		if v.Value {
+			return "true"
+		}
+		return "false"
+	case *GoExpr:
+		return v.Code
+	case *RawGoExpr:
+		return v.Code
+	default:
+		return ""
+	}
+}
+
+// skipTextChildren returns true if text element children should not be
+// processed as AddChild calls (they're already in WithText).
+func skipTextChildren(elem *Element) bool {
+	switch elem.Tag {
+	case "span", "p", "td", "th":
+		// text elements
+	default:
+		return false
+	}
+	// Only skip if there's a single text/expr child that was used for WithText
+	if len(elem.Children) != 1 {
+		return false
+	}
+	switch elem.Children[0].(type) {
+	case *TextContent, *GoExpr:
+		return true
+	}
+	return false
+}
+
+// textareaAttributeToOption maps textarea-specific attributes to tui.WithTextArea* options.
+var textareaAttributeToOption = map[string]string{
+	"width":            "tui.WithTextAreaWidth(%s)",
+	"maxHeight":        "tui.WithTextAreaMaxHeight(%s)",
+	"border":           "tui.WithTextAreaBorder(%s)",
+	"textStyle":        "tui.WithTextAreaTextStyle(%s)",
+	"value":            "tui.WithTextAreaValue(%s)",
+	"placeholder":      "tui.WithTextAreaPlaceholder(%s)",
+	"placeholderStyle": "tui.WithTextAreaPlaceholderStyle(%s)",
+	"cursor":           "tui.WithTextAreaCursor(%s)",
+	"focusColor":       "tui.WithTextAreaFocusColor(%s)",
+	"borderGradient":   "tui.WithTextAreaBorderGradient(%s)",
+	"focusGradient":    "tui.WithTextAreaFocusGradient(%s)",
+	"submitKey":        "tui.WithTextAreaSubmitKey(%s)",
+	"autoFocus":        "tui.WithTextAreaAutoFocus(%s)",
+}
+
+// textareaHandlerAttributes maps textarea event attributes to handler option funcs.
+var textareaHandlerAttributes = map[string]string{
+	"onSubmit": "tui.WithTextAreaOnSubmit",
+}
+
+// inputAttributeToOption maps input-specific attributes to tui.WithInput* options.
+var inputAttributeToOption = map[string]string{
+	"width":            "tui.WithInputWidth(%s)",
+	"border":           "tui.WithInputBorder(%s)",
+	"textStyle":        "tui.WithInputTextStyle(%s)",
+	"value":            "tui.WithInputValue(%s)",
+	"placeholder":      "tui.WithInputPlaceholder(%s)",
+	"placeholderStyle": "tui.WithInputPlaceholderStyle(%s)",
+	"cursor":           "tui.WithInputCursor(%s)",
+	"focusColor":       "tui.WithInputFocusColor(%s)",
+	"borderGradient":   "tui.WithInputBorderGradient(%s)",
+	"focusGradient":    "tui.WithInputFocusGradient(%s)",
+	"autoFocus":        "tui.WithInputAutoFocus(%s)",
+}
+
+// inputHandlerAttributes maps input event attributes to handler option funcs.
+var inputHandlerAttributes = map[string]string{
+	"onSubmit": "tui.WithInputOnSubmit",
+	"onChange": "tui.WithInputOnChange",
+}
+
+// modalAttributeToOption maps modal-specific attributes to tui.WithModal* options.
+var modalAttributeToOption = map[string]string{
+	"open":                 "tui.WithModalOpen(%s)",
+	"backdrop":             "tui.WithModalBackdrop(%s)",
+	"closeOnEscape":        "tui.WithModalCloseOnEscape(%s)",
+	"closeOnBackdropClick": "tui.WithModalCloseOnBackdropClick(%s)",
+	"trapFocus":            "tui.WithModalTrapFocus(%s)",
+	"keyMap":               "tui.WithModalKeyMap(%s)",
+}
+
+// modalHandlerAttributes maps modal event attributes to handler option funcs.
+var modalHandlerAttributes = map[string]string{}
+
+// componentConstructor returns the tui.New* constructor for a component element tag.
+func componentConstructor(tag string) string {
+	switch tag {
+	case "textarea":
+		return "tui.NewTextArea"
+	case "input":
+		return "tui.NewInput"
+	case "modal":
+		return "tui.NewModal"
+	default:
+		// Produce an identifier that won't compile, surfacing the mistake immediately.
+		return fmt.Sprintf("UNKNOWN_COMPONENT_%s", tag)
+	}
+}
+
+// generateComponentElementWithRefs generates an app.Mount() call for elements
+// that are backed by Component types (e.g., <textarea> → tui.NewTextArea).
+func (g *Generator) generateComponentElementWithRefs(elem *Element, parentVar string, inLoop bool) string {
+	varName := g.nextVar()
+	baseIndex := g.mountIndex
+	g.mountIndex++
+
+	indexExpr := g.loopIndexExpr(baseIndex)
+	if indexExpr == "" {
+		indexExpr = fmt.Sprintf("%d", baseIndex)
+	}
+
+	// Build component-specific options from attributes
+	elemOpts := g.buildComponentElementOptions(elem)
+
+	// For modal, also collect class-derived element options
+	if elem.Tag == "modal" {
+		classOpts := g.buildModalClassOptions(elem)
+		if len(classOpts) > 0 {
+			inner := strings.Join(classOpts, ", ")
+			elemOpts.options = append(elemOpts.options, fmt.Sprintf("tui.WithModalElementOptions(%s)", inner))
+		}
+	}
+
+	g.writef("%s := app.MountPersistent(%s, %s, func() tui.Component {\n", varName, g.currentReceiver, indexExpr)
+	g.indent++
+
+	constructor := componentConstructor(elem.Tag)
+
+	if len(elemOpts.options) == 0 {
+		g.writef("return %s()\n", constructor)
+	} else {
+		g.writef("return %s(\n", constructor)
+		g.indent++
+		for _, opt := range elemOpts.options {
+			g.writef("%s,\n", opt)
+		}
+		g.indent--
+		g.writef(")\n")
+	}
+
+	g.indent--
+	g.writeln("})")
+
+	// Handle ref binding
+	if elem.RefExpr != nil {
+		refName := elem.RefExpr.Code
+		if elem.RefKey != nil {
+			g.writef("%s.Put(%s, %s)\n", refName, elem.RefKey.Code, varName)
+		} else if inLoop {
+			g.writef("%s.Append(%s)\n", refName, varName)
+		} else {
+			g.writef("%s.Set(%s)\n", refName, varName)
+		}
+	}
+
+	// Generate children for component elements that accept them (modal)
+	if len(elem.Children) > 0 {
+		g.generateChildrenWithRefs(varName, elem.Children, inLoop, false, false)
+	}
+
+	if parentVar != "" {
+		g.writef("%s.AddChild(%s)\n", parentVar, varName)
+	}
+
+	return varName
+}
+
+// buildComponentElementOptions generates option expressions for a component element (e.g., textarea, input).
+func (g *Generator) buildComponentElementOptions(elem *Element) elementOptions {
+	var result elementOptions
+
+	// Select the correct attribute maps based on tag
+	attrMap, handlerMap := componentAttributeMaps(elem.Tag)
+
+	for _, attr := range elem.Attributes {
+		// Skip generic attributes handled elsewhere
+		if attr.Name == "class" || attr.Name == "id" || attr.Name == "ref" ||
+			attr.Name == "key" || attr.Name == "deps" {
+			continue
+		}
+
+		// Check handler attributes first
+		if optionFunc, isHandler := handlerMap[attr.Name]; isHandler {
+			handlerExpr := g.generateAttributeValue(attr.Value)
+			if handlerExpr != "" {
+				result.options = append(result.options, fmt.Sprintf("%s(%s)", optionFunc, handlerExpr))
+			}
+			continue
+		}
+
+		// Check component-specific attribute map
+		if template, ok := attrMap[attr.Name]; ok {
+			value := g.generateAttributeValue(attr.Value)
+			if value != "" {
+				// value attribute expects *State[string]; wrap string literals
+				if attr.Name == "value" {
+					if _, isStr := attr.Value.(*StringLit); isStr {
+						value = fmt.Sprintf("tui.NewState(%s)", value)
+					}
+				}
+				// open attribute expects *State[bool]; wrap bool literals
+				if attr.Name == "open" && elem.Tag == "modal" {
+					if _, isBool := attr.Value.(*BoolLit); isBool {
+						value = fmt.Sprintf("tui.NewState(%s)", value)
+					}
+				}
+				result.options = append(result.options, fmt.Sprintf(template, value))
+			}
+			continue
+		}
+	}
+
+	return result
+}
+
+// buildModalClassOptions extracts element options from the class attribute
+// for a modal element. These get wrapped in WithModalElementOptions.
+func (g *Generator) buildModalClassOptions(elem *Element) []string {
+	var opts []string
+	for _, attr := range elem.Attributes {
+		if attr.Name != "class" {
+			continue
+		}
+		classValue := g.getClassAttributeValue(attr)
+		if classValue == "" {
+			continue
+		}
+		twResult := ParseTailwindClasses(classValue)
+		opts = append(opts, twResult.Options...)
+		if len(twResult.TextMethods) > 0 {
+			textStyleOpt := BuildTextStyleOption(twResult.TextMethods)
+			if textStyleOpt != "" {
+				opts = append(opts, textStyleOpt)
+			}
+		}
+	}
+	return opts
+}
+
+// componentAttributeMaps returns the attribute and handler maps for a component element tag.
+func componentAttributeMaps(tag string) (attrMap map[string]string, handlerMap map[string]string) {
+	switch tag {
+	case "input":
+		return inputAttributeToOption, inputHandlerAttributes
+	case "textarea":
+		return textareaAttributeToOption, textareaHandlerAttributes
+	case "modal":
+		return modalAttributeToOption, modalHandlerAttributes
+	default:
+		// Unknown tags won't have any attribute mappings; componentConstructor
+		// will produce a compile error in the generated code.
+		return nil, nil
+	}
+}

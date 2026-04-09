@@ -12,13 +12,49 @@ import (
 
 var botGradient = tui.NewGradient(tui.BrightCyan, tui.BrightMagenta)
 
+var skills = map[string]string{
+	"discover": "Discover the world",
+	"learn":    "Learn about the world",
+	"create":   "Create something new",
+	"share":    "Share something with the world",
+	"help":     "Help: available commands are: help, clear, exit",
+}
+
 func main() {
+	slashCommands := map[string]chat.SlashCommandConfig{
+		"help": &chat.TransformCommand{
+			Transform: func(sc chat.SlashCommand) (string, error) {
+				return "Help: available commands are: help, clear", nil
+			},
+		},
+		"clear": &chat.ExecuteCommand{
+			Execute: func(app *chat.App, sc chat.SlashCommand) error {
+				if term := app.Terminal(); term != nil {
+					term.Clear()
+				}
+				return nil
+			},
+		},
+		"exit": &chat.ExecuteCommand{
+			Execute: func(app *chat.App, sc chat.SlashCommand) error {
+				app.Close()
+				return nil
+			},
+		},
+	}
+
+	for name, skill := range skills {
+		slashCommands[name] = &chat.TransformCommand{
+			Transform: func(sc chat.SlashCommand) (string, error) {
+				return skill, nil
+			},
+		}
+	}
 	shell := chat.New(chat.Config{
-		Instructions:        "Enter a message to send to the bot.",
-		DefaultMultiline:    true,
-		HandleResponse:      handleResponse,
-		SlashCommandHandler: slashCommandHandler,
-		SlashCommandNames:   []string{"help", "clear"},
+		Instructions:     "Enter a message to send to the bot.",
+		DefaultMultiline: true,
+		HandleResponse:   handleResponse,
+		SlashCommands:    slashCommands,
 	})
 
 	app, err := shell.Start()
@@ -55,20 +91,4 @@ func handleResponse(req *chat.Request) error {
 	req.SetStatus("Reply streamed")
 
 	return nil
-}
-
-func slashCommandHandler(app *chat.App, sc chat.SlashCommand) (chat.SlashResponse, error) {
-	switch sc.Name {
-	case "help":
-		if len(sc.Args) == 0 {
-			return sc.NewResponse("Help: available commands are: help, clear"), nil
-		}
-		return sc.NewResponse(fmt.Sprintf("Help: %s", sc.Args)), nil
-	case "clear":
-		if term := app.Terminal(); term != nil {
-			term.Clear()
-		}
-		return sc.Handled(), nil
-	}
-	return sc.Forward(), nil
 }

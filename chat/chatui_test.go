@@ -300,18 +300,21 @@ func TestSlashResponseHelpers(t *testing.T) {
 
 func TestDispatchSlashCommand(t *testing.T) {
 	shell := New(Config{
-		SlashCommandNames: []string{"local"},
-		SlashCommandHandler: func(_ *App, sc SlashCommand) (SlashResponse, error) {
-			if sc.Name == "local" {
-				return sc.Handled(), nil
-			}
-			return SlashResponse{}, nil
+		SlashCommands: map[string]SlashCommandConfig{
+			"local": &ExecuteCommand{
+				Execute: func(_ *App, _ SlashCommand) error { return nil },
+			},
 		},
 	})
 
 	resp, _, path, err := shell.dispatchSlashCommand("/local")
 	if err != nil || !path || resp.IsFallthrough() || !resp.Handled {
 		t.Fatalf("dispatch /local: resp=%+v path=%v err=%v", resp, path, err)
+	}
+
+	resp, _, path, err = shell.dispatchSlashCommand("/LOCAL")
+	if err != nil || !path || resp.IsFallthrough() || !resp.Handled {
+		t.Fatalf("dispatch /LOCAL (case): resp=%+v path=%v err=%v", resp, path, err)
 	}
 
 	resp, _, path, err = shell.dispatchSlashCommand("/other")
@@ -325,8 +328,12 @@ func TestDispatchSlashCommand(t *testing.T) {
 	}
 
 	errShell := New(Config{
-		SlashCommandHandler: func(_ *App, _ SlashCommand) (SlashResponse, error) {
-			return SlashResponse{}, errors.New("slash err")
+		SlashCommands: map[string]SlashCommandConfig{
+			"x": &TransformCommand{
+				Transform: func(SlashCommand) (string, error) {
+					return "", errors.New("slash err")
+				},
+			},
 		},
 	})
 	resp, _, path, err = errShell.dispatchSlashCommand("/x")
@@ -337,8 +344,22 @@ func TestDispatchSlashCommand(t *testing.T) {
 
 	none := New(Config{})
 	resp, _, path, err = none.dispatchSlashCommand("/x")
-	if err != nil || path || !resp.IsFallthrough() {
-		t.Fatalf("without handler: resp=%+v path=%v err=%v", resp, path, err)
+	if err != nil || !path || !resp.IsFallthrough() {
+		t.Fatalf("without SlashCommands: resp=%+v path=%v err=%v", resp, path, err)
+	}
+}
+
+func TestSlashCommandsNamesMergedAndSorted(t *testing.T) {
+	shell := New(Config{
+		SlashCommandNames: []string{"zebra"},
+		SlashCommands: map[string]SlashCommandConfig{
+			"apple":  &ExecuteCommand{Execute: func(*App, SlashCommand) error { return nil }},
+			"Banana": &ExecuteCommand{Execute: func(*App, SlashCommand) error { return nil }},
+		},
+	})
+	want := []string{"apple", "banana", "zebra"}
+	if !slices.Equal(shell.config.SlashCommandNames, want) {
+		t.Fatalf("SlashCommandNames = %v, want %v", shell.config.SlashCommandNames, want)
 	}
 }
 
@@ -359,6 +380,12 @@ func TestCompleteRequestClearsCustomStatus(t *testing.T) {
 	if got := shell.statusText(); got != "Ready. Submit a message to stream a response above the widget." {
 		t.Fatalf("idle statusText() = %q", got)
 	}
+}
+
+func TestApp_PrintAbovelnBeforeBindNoPanic(t *testing.T) {
+	shell := New(Config{HandleResponse: func(*Request) error { return nil }})
+	shell.PrintAboveln("%s", "a")
+	shell.QueuePrintAboveln("%s", "b")
 }
 
 type recordingStream struct {

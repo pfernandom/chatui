@@ -13,9 +13,17 @@ import (
 )
 
 const (
-	defaultPlaceholder     = "Type a message. Enter sends. Ctrl+J adds a newline."
-	defaultCompactHeight   = 6
-	defaultMultilineHeight = 9
+	defaultPlaceholder = "Type a message. Enter sends. Ctrl+J adds a newline."
+	// Inline shell height (go-tui region); large enough for wrapped long lines + chrome.
+	defaultCompactHeight   = 10
+	defaultMultilineHeight = 20
+	// TextArea shows at most this many wrapped rows; higher avoids clipping long pasted lines.
+	defaultTextAreaMaxHeight = 12
+	// Used before BindApp when terminal size is unknown (e.g. tests).
+	fallbackTextAreaWidth = 60
+	minTextAreaWidth      = 16
+	// Subtracted from terminal width when TextAreaWidth is 0 (auto).
+	termWidthGutter = 6
 )
 
 type Stream interface {
@@ -48,6 +56,9 @@ func (r *Request) SetStatus(text string) {
 	r.Shell.setRequestStatus(r.id, r.Context, text)
 }
 
+// ResponseHandler runs in its own goroutine per request. Use [Request.Stream] and
+// [App.PrintAboveln]/[App.QueuePrintAboveln] for terminal output; they are safe from
+// background goroutines (unlike calling [tui.App.PrintAboveln] on TerminalApp directly).
 type ResponseHandler func(*Request) error
 type MessageRenderer func(input string) string
 type ErrorRenderer func(err error) string
@@ -60,7 +71,7 @@ type SlashCommand struct {
 	Args string
 }
 
-// SlashResponse is returned by SlashCommandHandler to control echo and streaming.
+// SlashResponse controls echo and streaming for slash commands.
 type SlashResponse struct {
 	Command  SlashCommand
 	Response string
@@ -102,12 +113,6 @@ func (r SlashResponse) IsFallthrough() bool {
 	return r == SlashResponse{}
 }
 
-// SlashCommandHandler runs when Config.SlashCommandHandler is set and the trimmed line parses as a slash command.
-// Return SlashResponse{} (zero value) to fall through: echo the full line and stream with Input == trimmed.
-// Return Handled() to handle locally (no echo, no HandleResponse).
-// Return NewResponse or Forward with Handled false to echo Response and stream with Input == Response.
-type SlashCommandHandler func(*App, SlashCommand) (SlashResponse, error)
-
 // ParseSlashCommand reports whether trimmed begins with "/". Name is the first segment;
 // Args is the remainder after the first run of spaces. For "/" alone, Name and Args are empty.
 func ParseSlashCommand(trimmed string) (SlashCommand, bool) {
@@ -135,6 +140,12 @@ type Config struct {
 	MultilineHeight  int
 	DefaultMultiline bool
 	TextAreaOptions  []tui.TextAreaOption
+	// TextAreaWidth is the composer width in terminal cells. If 0, width is set at BindApp
+	// from the terminal size (minus a small gutter) so the field fits narrow windows.
+	TextAreaWidth int
+	// TextAreaMaxHeight is the maximum number of visible wrapped rows (go-tui TextArea).
+	// If 0, defaultTextAreaMaxHeight is used. Override with TextAreaOptions if needed.
+	TextAreaMaxHeight int
 
 	HandleResponse    ResponseHandler
 	RenderUserMessage MessageRenderer
@@ -145,8 +156,10 @@ type Config struct {
 	SettingsView OverlayView
 	HelpView     OverlayView
 
-	// SlashCommandHandler is optional. When set, ParseSlashCommand(trimmed) is used on submit.
-	SlashCommandHandler SlashCommandHandler
+	// SlashCommands maps lowercase command names (e.g. "help") to implementations.
+	// When set, registered names are merged into SlashCommandNames for autocomplete.
+	SlashCommands map[string]SlashCommandConfig
+
 	// SlashCommandNames lists available slash names without a leading "/". When non-empty,
 	// "/" triggers autocomplete hints and Tab completes the active (last) line when it looks
 	// like a single slash token (see package docs).
@@ -174,18 +187,25 @@ type App struct {
 
 	slashTabCycle      int
 	slashLastTabPrefix string
+
+	textareaSizedWidth int // last width passed to NewTextArea; -1 = not yet synced from terminal
 }
 
 func New(config Config) *App {
 	cfg := normalizeConfig(config)
+	for name := range cfg.SlashCommands {
+		cfg.SlashCommandNames = append(cfg.SlashCommandNames, strings.ToLower(strings.TrimSpace(name)))
+	}
+	cfg.SlashCommandNames = normalizeSlashNames(cfg.SlashCommandNames)
 
 	a := &App{
-		config:       cfg,
-		showSettings: tui.NewState(false),
-		showHelp:     tui.NewState(false),
-		multiline:    tui.NewState(cfg.DefaultMultiline),
-		streaming:    tui.NewState(false),
-		instructions: cfg.Instructions,
+		config:             cfg,
+		showSettings:       tui.NewState(false),
+		showHelp:           tui.NewState(false),
+		multiline:          tui.NewState(cfg.DefaultMultiline),
+		streaming:          tui.NewState(false),
+		instructions:       cfg.Instructions,
+		textareaSizedWidth: -1,
 	}
 	a.queueUpdate = func(fn func()) {
 		if fn != nil {
@@ -193,23 +213,50 @@ func New(config Config) *App {
 		}
 	}
 
-	opts := []tui.TextAreaOption{
-		tui.WithTextAreaWidth(60),
-		tui.WithTextAreaMaxHeight(4),
-		tui.WithTextAreaBorder(tui.BorderRounded),
-		tui.WithTextAreaPlaceholder(cfg.Placeholder),
-		tui.WithTextAreaAutoFocus(true),
-	}
-	opts = append(opts, cfg.TextAreaOptions...)
-	opts = append(opts, tui.WithTextAreaOnSubmit(a.send))
-	a.textarea = tui.NewTextArea(opts...)
+	a.textarea = tui.NewTextArea(a.textAreaOptions(fallbackTextAreaWidth)...)
 
 	return a
 }
 
+// textAreaOptions builds TextArea options for a given content width in cells.
+func (a *App) textAreaOptions(width int) []tui.TextAreaOption {
+	maxH := a.config.TextAreaMaxHeight
+	if maxH <= 0 { // defensive; normalizeConfig usually sets a positive default
+		maxH = defaultTextAreaMaxHeight
+	}
+	opts := []tui.TextAreaOption{
+		tui.WithTextAreaWidth(width),
+		tui.WithTextAreaMaxHeight(maxH),
+		tui.WithTextAreaBorder(tui.BorderRounded),
+		tui.WithTextAreaPlaceholder(a.config.Placeholder),
+		tui.WithTextAreaAutoFocus(true),
+	}
+	opts = append(opts, a.config.TextAreaOptions...)
+	opts = append(opts, tui.WithTextAreaOnSubmit(a.send))
+	return opts
+}
+
+// effectiveTextAreaWidth returns the composer width: explicit config, or terminal-based auto.
+func (a *App) effectiveTextAreaWidth(termWidth int) int {
+	if a.config.TextAreaWidth > 0 {
+		return a.config.TextAreaWidth
+	}
+	if termWidth <= 0 {
+		return fallbackTextAreaWidth
+	}
+	w := termWidth - termWidthGutter
+	if w < minTextAreaWidth {
+		w = minTextAreaWidth
+	}
+	return w
+}
+
 func (a *App) Start(opts ...tui.AppOption) (*tui.App, error) {
-	opts = append(opts, tui.WithInlineHeight(9))
-	opts = append(opts, tui.WithRootComponent(a))
+	base := []tui.AppOption{
+		tui.WithInlineHeight(a.inlineHeight()),
+		tui.WithRootComponent(a),
+	}
+	opts = append(base, opts...)
 	return tui.NewApp(opts...)
 }
 
@@ -224,19 +271,33 @@ func (a *App) BindApp(app *tui.App) {
 	a.showHelp.BindApp(app)
 	a.multiline.BindApp(app)
 	a.streaming.BindApp(app)
+
+	tw, _ := app.Terminal().Size()
+	wantW := a.effectiveTextAreaWidth(tw)
+	if wantW != a.textareaSizedWidth {
+		preserved := ""
+		if a.textarea != nil {
+			preserved = a.textarea.Text()
+		}
+		a.textarea = tui.NewTextArea(a.textAreaOptions(wantW)...)
+		if preserved != "" {
+			a.textarea.SetText(preserved)
+		}
+		a.textareaSizedWidth = wantW
+	}
+
 	a.textarea.BindApp(app)
 }
 
 // PrintAboveln appends a formatted line to the history region above the inline composer.
-// It forwards to the bound go-tui App; no-op if BindApp has not run yet.
+// Updates are queued on the go-tui main loop, so it is safe to call from any goroutine
+// (including [ResponseHandler]). No-op if BindApp has not run yet.
 func (a *App) PrintAboveln(format string, args ...any) {
-	if a == nil || a.app == nil {
-		return
-	}
-	a.app.PrintAboveln(format, args...)
+	a.QueuePrintAboveln(format, args...)
 }
 
-// QueuePrintAboveln is the goroutine-safe counterpart of [App.PrintAboveln].
+// QueuePrintAboveln is equivalent to [App.PrintAboveln]; both marshal work onto the
+// app's main loop. Kept for API compatibility with go-tui naming.
 func (a *App) QueuePrintAboveln(format string, args ...any) {
 	if a == nil || a.app == nil {
 		return
@@ -250,6 +311,13 @@ func (a *App) Terminal() tui.Terminal {
 		return nil
 	}
 	return a.app.Terminal()
+}
+
+func (a *App) Close() {
+	if a.app == nil {
+		return
+	}
+	a.app.Stop()
 }
 
 // IsFocused reports whether the composer is focused. It allows focus-gated key bindings
@@ -376,19 +444,25 @@ func (a *App) send(text string) {
 	a.startResponse(trimmed, SlashCommand{}, false)
 }
 
-// dispatchSlashCommand invokes the slash handler when configured and the line parses as a slash command.
-// slashPath is false when the handler is unset or the line is not a slash command (caller uses plain submit).
+// dispatchSlashCommand parses a slash line and optionally runs Config.SlashCommands[name].
+// slashPath is true when the input parses as a slash command (starts with "/"); the caller
+// then uses resp (fallthrough when zero) or handler output.
 func (a *App) dispatchSlashCommand(trimmed string) (resp SlashResponse, sc SlashCommand, slashPath bool, err error) {
-	if a.config.SlashCommandHandler == nil {
-		return SlashResponse{}, SlashCommand{}, false, nil
-	}
-	var ok bool
-	sc, ok = ParseSlashCommand(trimmed)
+	sc, ok := ParseSlashCommand(trimmed)
 	if !ok {
 		return SlashResponse{}, SlashCommand{}, false, nil
 	}
-	resp, err = a.config.SlashCommandHandler(a, sc)
-	return resp, sc, true, err
+	slashPath = true
+	if len(a.config.SlashCommands) == 0 {
+		return SlashResponse{}, sc, slashPath, nil
+	}
+	key := strings.ToLower(sc.Name)
+	handler, found := a.config.SlashCommands[key]
+	if !found {
+		return SlashResponse{}, sc, slashPath, nil
+	}
+	resp, err = handler.Handle(a, sc)
+	return resp, sc, slashPath, err
 }
 
 func (a *App) startResponse(input string, slash SlashCommand, fromSlash bool) {
@@ -729,6 +803,9 @@ func normalizeConfig(config Config) Config {
 		cfg.RenderError = func(err error) string {
 			return fmt.Sprintf("Error: %v", err)
 		}
+	}
+	if cfg.TextAreaMaxHeight <= 0 {
+		cfg.TextAreaMaxHeight = defaultTextAreaMaxHeight
 	}
 	cfg.SlashCommandNames = normalizeSlashNames(cfg.SlashCommandNames)
 	return cfg
