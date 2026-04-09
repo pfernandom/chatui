@@ -407,6 +407,28 @@ func TestDefaultRenderUserMessageDivider(t *testing.T) {
 	}
 }
 
+func TestStatusRowsForLayoutUsesMaxOfStreamingAndIdle(t *testing.T) {
+	shell := New(Config{})
+	inner := 32
+	wantStream := countWrappedLines(statusStreaming, inner)
+	wantReady := countWrappedLines(statusReady, inner)
+	want := wantStream
+	if wantReady > want {
+		want = wantReady
+	}
+	if got := shell.statusRowsForLayout(inner); got != want {
+		t.Fatalf("statusRowsForLayout(%d) = %d, want %d (max of streaming vs idle wraps)", inner, got, want)
+	}
+	shell.streaming.Set(true)
+	if got := shell.statusRowsForLayout(inner); got != want {
+		t.Fatalf("with streaming=true: statusRowsForLayout = %d, want %d (stable vs streaming flag)", got, want)
+	}
+	shell.streaming.Set(false)
+	if got := shell.statusRowsForLayout(inner); got != want {
+		t.Fatalf("with streaming=false: statusRowsForLayout = %d, want %d", got, want)
+	}
+}
+
 func TestCountWrappedLines(t *testing.T) {
 	tests := []struct {
 		s     string

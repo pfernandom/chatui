@@ -20,6 +20,9 @@ const (
 	defaultMultilineHeight = 20
 	// TextArea shows at most this many wrapped rows; higher avoids clipping long pasted lines.
 	defaultTextAreaMaxHeight = 12
+	// Default status strings (must stay in sync with statusText).
+	statusStreaming = "Streaming response..."
+	statusReady     = "Ready. Submit a message to stream a response above the widget."
 	// Used before BindApp when terminal size is unknown (e.g. tests).
 	fallbackTextAreaWidth = 60
 	minTextAreaWidth      = 16
@@ -756,7 +759,7 @@ func (a *App) computeInlineHeightForTerminal(termWidth, termHeight int) int {
 	if line := a.slashCommandsHintLine(); line != "" {
 		rows += countWrappedLines(line, inner)
 	}
-	rows += countWrappedLines(a.statusText(), inner)
+	rows += a.statusRowsForLayout(inner)
 	rows += a.textarea.Height()
 
 	if rows < minH {
@@ -832,6 +835,30 @@ func (a *App) modeLabel() string {
 	return "compact"
 }
 
+// statusRowsForLayout returns how many rows the status line may need, using the maximum of
+// built-in and override strings. This must not depend on the current streaming/idle choice alone,
+// or SetInlineHeight would change when switching between short "Streaming…" and long idle text,
+// which retriggers go-tui inline resize and corrupts streamed output (e.g. in Docker).
+func (a *App) statusRowsForLayout(inner int) int {
+	a.mu.Lock()
+	override := a.statusOverride
+	a.mu.Unlock()
+
+	n := countWrappedLines(statusStreaming, inner)
+	if x := countWrappedLines(statusReady, inner); x > n {
+		n = x
+	}
+	if override != "" {
+		if x := countWrappedLines(override, inner); x > n {
+			n = x
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 func (a *App) statusText() string {
 	a.mu.Lock()
 	status := a.statusOverride
@@ -840,9 +867,9 @@ func (a *App) statusText() string {
 		return status
 	}
 	if a.streaming.Get() {
-		return "Streaming response..."
+		return statusStreaming
 	}
-	return "Ready. Submit a message to stream a response above the widget."
+	return statusReady
 }
 
 func (a *App) renderOverlay(view OverlayView, fallbackTitle string) *tui.Element {
