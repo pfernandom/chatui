@@ -38,6 +38,10 @@ func main() {
 }
 
 func handleResponse(req *chat.Request) error {
+	if os.Getenv("CHATUI_DOCKER_STRESS") == "1" {
+		return handleDockerStress(req)
+	}
+
 	req.SetStatus("Preparing streamed reply...")
 	time.Sleep(120 * time.Millisecond)
 
@@ -54,6 +58,45 @@ func handleResponse(req *chat.Request) error {
 		time.Sleep(14 * time.Millisecond)
 	}
 
+	return nil
+}
+
+// handleDockerStress simulates agent-style output: plain stream bytes interleaved with
+// WriteElement tool cards (same pattern as StreamWriter.WriteElement → PrintAboveElement).
+// Set CHATUI_DOCKER_STRESS=1 when running ./scripts/docker-demo.sh or make docker-demo.
+func handleDockerStress(req *chat.Request) error {
+	req.SetStatus("Stress: stream + tool card…")
+	chunk := `The user wants a simple Python web server. I can provide a few options:
+1. Using the built-in http.server module.
+2. Using Flask for a more customizable server.
+
+`
+	for _, r := range chunk {
+		if _, err := req.Stream.Write([]byte(string(r))); err != nil {
+			return err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	toolLine := "Executing command: cat <<EOF > simple_web_server/server.py"
+	box := tui.New(
+		tui.WithDisplay(tui.DisplayFlex),
+		tui.WithDirection(tui.Column),
+		tui.WithBorder(tui.BorderRounded),
+	)
+	box.AddChild(tui.New(
+		tui.WithText(toolLine),
+		tui.WithTextStyle(tui.NewStyle().Foreground(tui.Yellow)),
+	))
+	req.Stream.WriteElement(box)
+
+	code := "import http.server\nimport socketserver\n\nPORT = 8000\n"
+	for _, r := range code {
+		if _, err := req.Stream.Write([]byte(string(r))); err != nil {
+			return err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	return nil
 }
 

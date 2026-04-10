@@ -1,4 +1,2 @@
-github.com/pfernandom/go-tui v0.12.0 h1:4DROnJ2PqvWnUlqwhNENHS1UWavLHkJMeT2kP+JMqmw=
-github.com/pfernandom/go-tui v0.12.0/go.mod h1:7Auryi6hcfS5tnrZm2Gpq8ktKrDW79qOqYiXa0F+cKE=
 golang.org/x/sys v0.40.0 h1:DBZZqJ2Rkml6QMQsZywtnjnnGvHza6BTfYFWY9kjEWQ=
 golang.org/x/sys v0.40.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=

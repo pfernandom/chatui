@@ -1,0 +1,3 @@
+[submodule "third_party/go-tui"]
+	path = third_party/go-tui
+	url = https://github.com/pfernandom/go-tui.git

@@ -8,6 +8,7 @@ This repository is a small Go module centered on a reusable inline chat shell bu
 - `chat/`: reusable package code and tests
 - `cmd/simple-chat/`, `cmd/simple-chat-2/`: alternative runnable examples
 - `go.mod`, `go.sum`: module definition and dependencies
+- `third_party/go-tui`: **git submodule** — [github.com/pfernandom/go-tui](https://github.com/pfernandom/go-tui) (fork). The root `go.mod` uses `replace github.com/pfernandom/go-tui => ./third_party/go-tui` so builds in this repo use the submodule. **Downstream modules that import `chatui` ignore that `replace`** and still resolve `go-tui` via the version in `require` (module proxy / `go get`).
 
 Keep reusable behavior in `chat/`. Reserve `main.go` and `cmd/` programs for demos or integration examples.
 
@@ -15,7 +16,15 @@ Keep reusable behavior in `chat/`. Reserve `main.go` and `cmd/` programs for dem
 
 Do not commit a `vendor/` tree or loose copies of third-party module sources in the tree.
 
-Terminal UI comes from **`github.com/pfernandom/go-tui`** as a normal module dependency (`go.mod` / `go.sum`). Consumers only need `go mod download`; no `replace` and no submodule. Fixes and releases are developed in the fork repository; bump the version here with `go get github.com/pfernandom/go-tui@vx.y.z` (or `@main` / a commit pseudo-version while iterating).
+**Working in this repository:** after `git clone`, initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
+
+Edit code under `third_party/go-tui`, commit the submodule pointer in the parent repo when you advance the fork, and bump the `require github.com/pfernandom/go-tui` version in `go.mod` when you want the declared version to match a tagged release of the fork (`go get github.com/pfernandom/go-tui@vx.y.z` updates the requirement; the `replace` continues to point at `./third_party/go-tui` for local builds).
+
+**Consuming `chatui` as a dependency:** use `go get github.com/pfernandom/chatui@v…` as usual; your module does not need this submodule — Go uses the published `go-tui` version from `require` only.
 
 ## Build, Test, and Development Commands
 
@@ -24,12 +33,15 @@ Terminal UI comes from **`github.com/pfernandom/go-tui`** as a normal module dep
 - `go run .`: run the primary demo from the repository root
 - `go run ./cmd/simple-chat`: run the first minimal example
 - `go run ./cmd/simple-chat-2`: run the second minimal example
+- `make docker-demo` or `./scripts/docker-demo.sh`: build and run the demo in Docker (**`-it` TTY required**). Optional `CHATUI_DOCKER_STRESS=1` exercises stream output plus `WriteElement` tool cards (similar to agent UIs).
 
 If the local Go build cache is restricted, use:
 
 ```bash
 env GOCACHE=/tmp/chatui-go-build-cache go test ./...
 ```
+
+Docker builds need the submodule checked out before `docker build` (so `third_party/go-tui` exists in the build context). CI should run `git submodule update --init --recursive` first.
 
 ## Coding Style & Naming Conventions
 
